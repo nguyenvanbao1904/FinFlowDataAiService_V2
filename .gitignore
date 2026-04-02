@@ -1,0 +1,11 @@
+.env
+.env.local
+*.pem
+venv/
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+crawler_state.json
+failed_report.json
+*.log
