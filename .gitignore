@@ -1,11 +1,44 @@
+# Secrets and local config
 .env
-.env.local
+.env.*
+!.env.example
 *.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Python environment and caches
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# IDE and OS
+.DS_Store
+.idea/
 
 # Runtime artifacts
 crawler_state.json
 failed_report.json
 *.log
+*.pid
+
+# AI/Data outputs (generated)
+artifacts/
+exports/
+
+# Model/checkpoint binaries
+*.joblib
+*.pkl
+*.pickle
+*.onnx
+*.h5
+*.pt
+*.pth

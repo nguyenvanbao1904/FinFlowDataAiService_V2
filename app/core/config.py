@@ -1,7 +1,19 @@
-from pydantic_settings import BaseSettings
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Luôn đọc `.env` ở gốc package `data_ai_service/` (không phụ thuộc cwd khi chạy uvicorn từ repo root).
+_SERVICE_ROOT = Path(__file__).resolve().parents[2]
+_ENV_FILE = _SERVICE_ROOT / ".env"
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     PROJECT_NAME: str = "FinFlow Data & AI Service"
     API_V1_STR: str = "/api/v1"
 
@@ -18,8 +30,13 @@ class Settings(BaseSettings):
     # Vnstock
     VNSTOCK_API_KEY: str = ""
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    # Export script / optional DB (same MySQL as Spring backend)
+    FINFLOW_DATABASE_URL: str = ""
+    MYSQL_HOST: str = "127.0.0.1"
+    MYSQL_PORT: int = 3306
+    MYSQL_USER: str = ""
+    MYSQL_PASSWORD: str = ""
+    MYSQL_DATABASE: str = ""
+
 
 settings = Settings()
