@@ -27,6 +27,26 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = "gemini-2.5-flash-lite"
     GEMINI_TIMEOUT_SECONDS: int = 60
 
+    # Hybrid routing defaults:
+    # - local for simple structured tasks (prefill, typo-fix, chunk normalization)
+    # - google for complex analysis (stock reasoning, deep recommendations)
+    SIMPLE_LLM_PROVIDER: str = "local"
+    COMPLEX_LLM_PROVIDER: str = "google"
+
+    # Fast local model profile for simple tasks.
+    LOCAL_LLM_BASE_URL: str = "http://127.0.0.1:9090/v1"
+    LOCAL_LLM_API_KEY: str = "no-key-required"
+    LOCAL_LLM_MODEL: str = "mlx-community/gemma-4-e2b-it-4bit"
+    # on: always think, off: never think, auto: think first and fallback to no-think retry.
+    LOCAL_LLM_THINKING_MODE: str = "auto"
+
+    # Transaction prefill behavior:
+    # false => trust model output (strict mode), true => apply keyword-based category correction.
+    PREFILL_ENABLE_CATEGORY_HEURISTIC: bool = False
+    # Keep response structurally consistent for UI: if category type conflicts with tx type,
+    # align tx type to the category type instead of leaving an inconsistent pair.
+    PREFILL_ENFORCE_TYPE_CATEGORY_CONSISTENCY: bool = True
+
     # Vnstock
     VNSTOCK_API_KEY: str = ""
 
