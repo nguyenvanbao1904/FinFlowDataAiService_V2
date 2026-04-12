@@ -21,24 +21,17 @@ class Settings(BaseSettings):
     JAVA_BACKEND_URL: str = "http://localhost:8080/api/internal"
     INTERNAL_API_KEY: str = ""
 
-    # AI
-    OPENAI_API_KEY: str = ""
-    GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.5-flash-lite"
-    GEMINI_TIMEOUT_SECONDS: int = 60
+    # AI (DeepSeek)
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_MODEL: str = "deepseek-chat"
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+    LLM_TIMEOUT_SECONDS: int = 60
 
-    # Hybrid routing defaults:
-    # - local for simple structured tasks (prefill, typo-fix, chunk normalization)
-    # - google for complex analysis (stock reasoning, deep recommendations)
-    SIMPLE_LLM_PROVIDER: str = "local"
-    COMPLEX_LLM_PROVIDER: str = "google"
 
-    # Fast local model profile for simple tasks.
-    LOCAL_LLM_BASE_URL: str = "http://127.0.0.1:9090/v1"
-    LOCAL_LLM_API_KEY: str = "no-key-required"
-    LOCAL_LLM_MODEL: str = "mlx-community/gemma-4-e2b-it-4bit"
-    # on: always think, off: never think, auto: think first and fallback to no-think retry.
-    LOCAL_LLM_THINKING_MODE: str = "auto"
+    # Local embedding model (OpenAI-compatible API)
+    LOCAL_EMBEDDING_BASE_URL: str = ""
+    LOCAL_EMBEDDING_API_KEY: str = "no-key-required"
+    LOCAL_EMBEDDING_MODEL: str = ""
 
     # Transaction prefill behavior:
     # false => trust model output (strict mode), true => apply keyword-based category correction.
@@ -57,6 +50,42 @@ class Settings(BaseSettings):
     MYSQL_USER: str = ""
     MYSQL_PASSWORD: str = ""
     MYSQL_DATABASE: str = ""
+
+    # Chat orchestration
+    CHAT_TOOL_TIMEOUT_SECONDS: int = 30
+    CHAT_RAG_ENABLED: bool = True
+    CHAT_RAG_CHUNKS_DB: str = str(_SERVICE_ROOT / "artifacts" / "rag" / "annual_reports" / "chunks" / "annual_reports_chunks.sqlite")
+    CHAT_QDRANT_URL: str = "http://127.0.0.1:6333"
+    CHAT_QDRANT_API_KEY: str = ""
+    CHAT_QDRANT_COLLECTION: str = "annual_report_chunks_bge_m3"
+    CHAT_RAG_TOPK_VECTOR: int = 6
+    CHAT_RAG_TOPK_KEYWORD: int = 6
+    CHAT_RAG_TOPK_FINAL: int = 6
+    CHAT_DEBUG_LOG_PROMPTS: bool = False
+    CHAT_DEBUG_LOG_MAX_CHARS: int = 8000
+    CHAT_FORECAST_ENABLED: bool = True
+    CHAT_FORECAST_REPORT_TABLE_CSV: str = str(
+        _SERVICE_ROOT / "artifacts" / "models" / "final_model_pipeline" / "report_table.csv"
+    )
+    CHAT_FORECAST_DETAIL_CSV: str = str(
+        _SERVICE_ROOT / "artifacts" / "models" / "final_model_pipeline" / "predict_detail.csv"
+    )
+    CHAT_FORECAST_SUMMARY_JSON: str = str(
+        _SERVICE_ROOT / "artifacts" / "models" / "final_model_pipeline" / "summary.json"
+    )
+    CHAT_FORECAST_ON_DEMAND_ENABLED: bool = True
+    CHAT_FORECAST_ON_DEMAND_SCRIPT: str = str(
+        _SERVICE_ROOT / "scripts" / "financial_training" / "test_final_models_forecast.py"
+    )
+    CHAT_FORECAST_ON_DEMAND_OUTPUT_DIR: str = str(
+        _SERVICE_ROOT / "artifacts" / "models" / "final_model_pipeline" / "on_demand"
+    )
+    CHAT_FORECAST_ON_DEMAND_TIMEOUT_SECONDS: int = 180
+    CHAT_FORECAST_TOP_FACTORS: int = 5
+
+    # DeepSeek price snapshot (USD per 1M tokens)
+    CHAT_DEEPSEEK_INPUT_PRICE_PER_1M: float = 0.10
+    CHAT_DEEPSEEK_OUTPUT_PRICE_PER_1M: float = 0.40
 
 
 settings = Settings()

@@ -8,20 +8,37 @@ This is a standalone Python microservice that runs alongside the Java Spring Boo
 2. **AI & Analysis**: Running predictions, calculating technical indicators, and providing intelligent portfolio insights using LangChain / OpenAI.
 3. **Data Sync**: Pushing processed data to the Java Backend via internal HTTP APIs (REST).
 
-## Architecture (Cleanup for AI phase)
+## Architecture
 
-Current structure keeps runtime stable while aligning to Clean Architecture boundaries:
+```
+app/
+├── main.py                    # FastAPI entry + routes
+├── core/config.py             # pydantic-settings configuration
+├── domain/
+│   ├── entities/              # Request/response DTOs (Pydantic models)
+│   └── ports/                 # Abstract contracts (e.g. BackendSyncPort)
+├── services/
+│   ├── chat/                  # ReAct agent: orchestrator, LLM client, tools, RAG, valuation
+│   ├── transaction_prefill_service.py
+│   ├── analytics_insights_service.py
+│   ├── chat_orchestrator_service.py
+│   ├── forecast_tool_service.py
+│   ├── rag_retrieval_service.py
+│   ├── market_data_tool_client.py
+│   ├── crawler_service.py     # vnstock + FireAnt data crawling
+│   ├── fireant_profile.py
+│   ├── icb_normalization.py
+│   ├── icb_tree_sync.py
+│   └── vision_ocr.py         # Apple Vision OCR (macOS ARM64)
+├── clients/
+│   └── java_backend_client.py # HTTP sync to Java backend
+└── jobs/
+    └── batch_crawler.py       # Multi-process market data crawler
+scripts/
+└── financial_training/        # Offline pipelines: model training, RAG indexing, embedding
+```
 
-- `app/domain/entities/`: domain DTO/entities used by use cases and crawlers.
-- `app/domain/ports/`: abstraction ports (e.g. backend sync contract).
-- `app/services/`: crawler-focused application logic (to be split into use cases gradually).
-- `app/clients/`: outbound adapters (HTTP client to Java backend).
-- `app/core/`: config and framework wiring.
-
-Notes:
-
-- `app/models/investment.py` is kept as a backward-compatible import path and now re-exports from `app/domain/entities/investment.py`.
-- Runtime artifacts (`crawler_state.json`, `failed_report.json`) are intentionally ignored via `.gitignore`.
+Runtime artifacts (`crawler_state.json`, `failed_report.json`) are gitignored.
 
 ## Installation
 
@@ -298,16 +315,17 @@ Notes for Cafef mode:
 ## AI Transaction Prefill API
 
 - Endpoint: `POST /api/v1/ai/transaction-prefill`
-- Purpose: receive OCR/manual text from FE, call Gemini (JSON mode), return structured prefill JSON. This endpoint does not save data to backend.
+- Purpose: receive OCR/manual text from FE, call local/OpenAI-compatible LLM (JSON mode), return structured prefill JSON. This endpoint does not save data to backend.
 - Security: when `INTERNAL_API_KEY` is configured, caller must provide header `X-Internal-Api-Key`.
 
 ### Required env
 
-- `GEMINI_API_KEY`
+- `LOCAL_LLM_BASE_URL`
+- `LOCAL_LLM_MODEL`
 - `INTERNAL_API_KEY` (must match backend `INTERNAL_API_KEY` for `/api/internal/**`)
 - Optional:
-  - `GEMINI_MODEL` (default: `gemini-1.5-flash`)
-  - `GEMINI_TIMEOUT_SECONDS` (default: `20`)
+  - `LOCAL_LLM_API_KEY` (default: `no-key-required`)
+  - `LLM_TIMEOUT_SECONDS` (default: `60`)
 
 ### Request example
 

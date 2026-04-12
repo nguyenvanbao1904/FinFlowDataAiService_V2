@@ -1,0 +1,134 @@
+{
+  "BANK": {
+    "method": "P/B, P/E",
+    "weights": { "pe": 0.3, "pb": 0.7, "ps": 0.0 },
+    "target_model": "single_stage_pb",
+    "params": {
+      "default_coe": 0.11,
+      "default_growth": 0.05,
+      "margin_pct": 10
+    },
+    "rationale": "Ngân hàng là định chế tài chính kinh doanh trên dòng vốn. Phân nửa tài sản được hạch toán theo giá trị thị trường (Mark-to-market). Do đó, Giá trị sổ sách (Book Value) phản ánh sát nhất rủi ro hệ thống và sức khỏe phòng thủ, trong khi P/E đóng vai trò phụ trợ cho hiệu quả sinh lời ngắn hạn.",
+    "source": "Aswath Damodaran - Valuing Financial Service Firms"
+  },
+  "SECURITIES": {
+    "method": "P/E, P/B",
+    "weights": { "pe": 0.5, "pb": 0.5, "ps": 0.0 },
+    "target_model": "single_stage_pb",
+    "params": {
+      "default_coe": 0.13,
+      "default_growth": 0.05,
+      "margin_pct": 15
+    },
+    "rationale": "Các công ty chứng khoán có lợi nhuận biến động cực mạnh theo chu kỳ thị trường (cần định giá bằng P/E). Tuy nhiên, họ lại chịu rủi ro tín dụng rất lớn từ hoạt động cho vay Margin, do đó giá trị sổ sách (P/B) là bộ đệm an toàn không thể thiếu để đánh giá rủi ro phá sản.",
+    "source": "CFA Program Curriculum - Valuation of Financial Institutions"
+  },
+  "REAL_ESTATE": {
+    "method": "P/B, P/E",
+    "weights": { "pe": 0.3, "pb": 0.7, "ps": 0.0 },
+    "target_model": "single_stage_pb",
+    "params": {
+      "default_coe": 0.13,
+      "default_growth": 0.05,
+      "margin_pct": 15
+    },
+    "rationale": "Đặc thù ngành Bất động sản là ghi nhận doanh thu không đều (chỉ hạch toán khi bàn giao dự án), làm cho chỉ số P/E bị nhiễu và ảo. Định giá dựa trên tài sản ròng và quỹ đất (thông qua P/B) sẽ cung cấp một góc nhìn an toàn và mang tính dài hạn hơn.",
+    "source": "CFA Program Curriculum - Asset-based Valuation"
+  },
+  "RETAIL": {
+    "method": "P/E, P/S",
+    "weights": { "pe": 0.6, "pb": 0.0, "ps": 0.4 },
+    "target_model": "peg_adjusted",
+    "params": {
+      "default_coe": 0.12,
+      "default_growth": 0.07,
+      "margin_pct": 10
+    },
+    "rationale": "Ngành bán lẻ thâm dụng vốn lưu động (hàng tồn kho) thay vì tài sản cố định, nên P/B ít có ý nghĩa. Động lực tăng giá trị nằm ở khả năng chiếm lĩnh thị phần qua luân chuyển hàng hóa (thể hiện qua P/S) và tối ưu biên lợi nhuận ròng (thể hiện qua P/E).",
+    "source": "Aswath Damodaran - Valuing Retailers"
+  },
+  "TECHNOLOGY": {
+    "method": "P/E, P/S",
+    "weights": { "pe": 0.7, "pb": 0.0, "ps": 0.3 },
+    "target_model": "peg_adjusted",
+    "params": {
+      "default_coe": 0.12,
+      "default_growth": 0.08,
+      "margin_pct": 10
+    },
+    "rationale": "Các công ty công nghệ có mô hình kinh doanh 'Asset-light' (tài sản vô hình là chủ yếu). Giá trị cốt lõi nằm ở chất xám, công nghệ và khả năng mở rộng quy mô (Scale) - những thứ không lọt vào Bảng cân đối kế toán. Định giá P/B sẽ làm sai lệch, hệ thống ưu tiên sử dụng P/E và P/S.",
+    "source": "Aswath Damodaran - Valuing Technology Companies"
+  },
+  "MANUFACTURING_HEAVY": {
+    "method": "P/E, P/B",
+    "weights": { "pe": 0.6, "pb": 0.4, "ps": 0.0 },
+    "target_model": "peg_adjusted",
+    "params": {
+      "default_coe": 0.12,
+      "default_growth": 0.05,
+      "margin_pct": 10
+    },
+    "rationale": "Ngành sản xuất công nghiệp nặng đòi hỏi đầu tư tài sản cố định (Capex) cực lớn và mang tính chu kỳ cao. P/E là thước đo chính khi chu kỳ thuận lợi, nhưng P/B bắt buộc dùng làm 'tấm đệm an toàn' (Margin of Safety) khi lợi nhuận chạm đáy.",
+    "source": "Aswath Damodaran - Valuing Cyclical and Commodity Companies"
+  },
+  "FMCG": {
+    "method": "P/E",
+    "weights": { "pe": 0.8, "pb": 0.1, "ps": 0.1 },
+    "target_model": "peg_adjusted",
+    "params": {
+      "default_coe": 0.11,
+      "default_growth": 0.06,
+      "margin_pct": 10
+    },
+    "rationale": "Ngành tiêu dùng nhanh (FMCG) thường có ROE rất cao nhờ lợi thế cạnh tranh (Moat) từ thương hiệu. P/B sẽ luôn định giá quá đắt đối với nhóm này. P/E là thước đo hiệu quả nhất để định giá những 'cỗ máy in tiền' ổn định (Cash Cow).",
+    "source": "CFA Program Curriculum - Equity Valuation"
+  },
+  "UTILITIES": {
+    "method": "P/E, P/B",
+    "weights": { "pe": 0.6, "pb": 0.4, "ps": 0.0 },
+    "target_model": "peg_adjusted",
+    "params": {
+      "default_coe": 0.10,
+      "default_growth": 0.04,
+      "margin_pct": 10
+    },
+    "rationale": "Ngành tiện ích (Điện, Nước) có dòng tiền ổn định, lợi nhuận được đảm bảo bằng hợp đồng mua bán dài hạn (PPA) dựa trên tổng mức đầu tư. Sự kết hợp giữa dòng tiền đều (P/E) và nền tảng tài sản vững chắc (P/B) là phương pháp tối ưu.",
+    "source": "Aswath Damodaran - Valuing Infrastructure and Utility Companies"
+  },
+  "LOGISTICS_PORTS": {
+    "method": "P/E, P/B",
+    "weights": { "pe": 0.6, "pb": 0.4, "ps": 0.0 },
+    "target_model": "peg_adjusted",
+    "params": {
+      "default_coe": 0.12,
+      "default_growth": 0.05,
+      "margin_pct": 10
+    },
+    "rationale": "Ngành cảng biển, vận tải sở hữu khối tài sản hạ tầng rất lớn nhưng phải đối mặt với sự biến động chu kỳ khốc liệt của cước vận tải toàn cầu. Vì vậy, lợi nhuận (P/E) phản ánh tiềm năng tăng trưởng, còn tài sản (P/B) dùng để neo giá trị thực khi khủng hoảng kinh tế.",
+    "source": "Aswath Damodaran - Valuing Cyclical and Commodity Companies"
+  },
+  "HEALTHCARE": {
+    "method": "P/E",
+    "weights": { "pe": 0.8, "pb": 0.1, "ps": 0.1 },
+    "target_model": "peg_adjusted",
+    "params": {
+      "default_coe": 0.11,
+      "default_growth": 0.06,
+      "margin_pct": 10
+    },
+    "rationale": "Ngành y tế, dược phẩm mang tính phòng thủ cực đoan (ít chịu tác động ngoại cảnh). P/E là phương pháp chủ đạo để đo lường khả năng sinh lời và mở rộng chuỗi nhà thuốc/bệnh viện. Tài sản không cố định (P/B) không phải là nhân tố chính thúc đẩy tăng trưởng cốt lõi ở nhóm này.",
+    "source": "CFA Program Curriculum - Equity Valuation"
+  },
+  "DEFAULT": {
+    "method": "P/E, P/B",
+    "weights": { "pe": 0.6, "pb": 0.4, "ps": 0.0 },
+    "target_model": "peg_adjusted",
+    "params": {
+      "default_coe": 0.12,
+      "default_growth": 0.05,
+      "margin_pct": 10
+    },
+    "rationale": "Dựa trên mô hình định giá cân bằng, hệ thống kết hợp giữa khả năng sinh lời dự phóng (P/E) và giá trị tài sản (P/B) để đảm bảo định giá không bị thiên lệch vào một yếu tố ngắn hạn.",
+    "source": "FinFlow Base Valuation Framework"
+  }
+}
