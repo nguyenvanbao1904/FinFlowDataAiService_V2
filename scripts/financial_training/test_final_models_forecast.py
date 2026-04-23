@@ -551,7 +551,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=ROOT / "artifacts" / "models" / "final_model_pipeline",
+        default=ROOT / "artifacts" / "models" / "production_pipeline",
         help="Directory containing the 4 model joblib files",
     )
     parser.add_argument("--bank-revenue-model", type=Path, default=None)
@@ -834,7 +834,7 @@ def main() -> None:
 
     if args.out_csv is None:
         suffix = "" if args.predict_target == "both" else f"_{args.predict_target}"
-        out_csv = ROOT / "artifacts" / "models" / "final_model_pipeline" / f"forecast_{symbol}_{args.base_year}_{args.to_year}{suffix}.csv"
+        out_csv = ROOT / "artifacts" / "models" / "production_pipeline" / f"forecast_{symbol}_{args.base_year}_{args.to_year}{suffix}.csv"
     else:
         out_csv = Path(args.out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)

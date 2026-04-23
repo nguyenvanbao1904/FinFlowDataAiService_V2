@@ -913,7 +913,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=ROOT / "artifacts" / "models" / "final_model_pipeline",
+        default=ROOT / "artifacts" / "models" / "production_pipeline",
     )
     return parser
 

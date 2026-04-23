@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     # Vnstock
     VNSTOCK_API_KEY: str = ""
 
+    # FireAnt (optional — company profile, ICB tree)
+    FIREANT_ACCESS_TOKEN: str = ""
+    FIREANT_API_BASE: str = "https://restv2.fireant.vn"
+
     # Export script / optional DB (same MySQL as Spring backend)
     FINFLOW_DATABASE_URL: str = ""
     MYSQL_HOST: str = "127.0.0.1"
@@ -65,20 +69,20 @@ class Settings(BaseSettings):
     CHAT_DEBUG_LOG_MAX_CHARS: int = 8000
     CHAT_FORECAST_ENABLED: bool = True
     CHAT_FORECAST_REPORT_TABLE_CSV: str = str(
-        _SERVICE_ROOT / "artifacts" / "models" / "final_model_pipeline" / "report_table.csv"
+        _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "report_table.csv"
     )
     CHAT_FORECAST_DETAIL_CSV: str = str(
-        _SERVICE_ROOT / "artifacts" / "models" / "final_model_pipeline" / "predict_detail.csv"
+        _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "predict_detail.csv"
     )
     CHAT_FORECAST_SUMMARY_JSON: str = str(
-        _SERVICE_ROOT / "artifacts" / "models" / "final_model_pipeline" / "summary.json"
+        _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "summary.json"
     )
     CHAT_FORECAST_ON_DEMAND_ENABLED: bool = True
     CHAT_FORECAST_ON_DEMAND_SCRIPT: str = str(
         _SERVICE_ROOT / "scripts" / "financial_training" / "test_final_models_forecast.py"
     )
     CHAT_FORECAST_ON_DEMAND_OUTPUT_DIR: str = str(
-        _SERVICE_ROOT / "artifacts" / "models" / "final_model_pipeline" / "on_demand"
+        _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "on_demand"
     )
     CHAT_FORECAST_ON_DEMAND_TIMEOUT_SECONDS: int = 180
     CHAT_FORECAST_TOP_FACTORS: int = 5
