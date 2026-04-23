@@ -9,31 +9,31 @@ import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
-if os.getenv("VNSTOCK_API_KEY"):
-    os.environ["VNSTOCK_API_KEY"] = os.getenv("VNSTOCK_API_KEY")
+_vnstock_key = os.getenv("VNSTOCK_API_KEY")
+if _vnstock_key:
+    os.environ["VNSTOCK_API_KEY"] = _vnstock_key
 
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import Manager, Lock
-from app.domain.entities.investment import CompanyModel
-from app.services.icb_tree_sync import build_industry_node_payloads
-from app.services.crawler_service import VnstockCrawlerService
-from app.clients.java_backend_client import JavaBackendClient
+from app.models.investment import CompanyModel
+from app.infrastructure.crawler.icb_sync import build_industry_node_payloads
+from app.infrastructure.crawler.vnstock_adapter import VnstockCrawlerService
+from app.infrastructure.backend_client import JavaBackendClient
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 log_lock = Lock()
 
 STATE_FILE = "crawler_state.json"
-MAX_WORKERS = 8  # Tăng lên 8 nhờ API Key Community (60 req/phút)
+MAX_WORKERS = 8
 RETRY_MAX = 3
 RATE_LIMIT_DEFAULT = 15
 SAFE_DELAY = 1
-
-
-def log(msg):
-    prefix = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-    with log_lock:
-        print(f"{prefix}{msg}")
 
 
 def load_state():
@@ -71,7 +71,7 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
                 current_time = time.time()
                 time_to_wait = max(0, manager_dict["rate_limit_wait_until"] - current_time)
                 if time_to_wait > 0:
-                    log(
+                    logger.info(
                         f"[{symbol}] Đang chờ {time_to_wait:.0f}s do Rate Limit từ tiến trình khác..."
                     )
                     time.sleep(time_to_wait)
@@ -86,29 +86,30 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
                         raise Exception("Rate limit exceeded")
                 return res, warnings
 
-            except (Exception, SystemExit) as e:
+            except Exception as e:
                 err_msg = str(e)
-                # Catch generic rate limit texts from vnstock's stack traces or prints, or if SystemExit is raised by vnstock
+                # Catch generic rate limit texts from vnstock's stack traces or prints
                 if (
-                    isinstance(e, SystemExit)
-                    or "tối đa" in err_msg.lower()
+                    "tối đa" in err_msg.lower()
                     or "limit" in err_msg.lower()
                     or "thử lại" in err_msg.lower()
                     or "Too Many Requests" in err_msg
                 ):
                     match = re.search(r"thử lại sau (\d+) giây", err_msg)
                     wait_time = int(match.group(1)) if match else RATE_LIMIT_DEFAULT
+                    retries += 1
                     with api_lock:
-                        new_wait = time.time() + wait_time + 5  # Thêm 5s buffer
+                        new_wait = time.time() + wait_time + 5
                         if new_wait > manager_dict["rate_limit_wait_until"]:
                             manager_dict["rate_limit_wait_until"] = new_wait
-                            log(
-                                f"🚨 RATE LIMIT DETECTED! Hệ thống đang chờ {wait_time + 5}s trước khi chạy tiếp..."
+                            logger.warning(
+                                "RATE LIMIT DETECTED for %s! Waiting %ds before retry %d/%d",
+                                symbol, wait_time + 5, retries, RETRY_MAX,
                             )
                 else:
                     retries += 1
                     time.sleep(2**retries)
-                    log(f"[{symbol}] Lỗi: {err_msg}. Thử lại lần {retries}/{RETRY_MAX}...")
+                    logger.info(f"[{symbol}] Lỗi: {err_msg}. Thử lại lần {retries}/{RETRY_MAX}...")
 
         return [], [f"Failed after {RETRY_MAX} retries"]
 
@@ -141,12 +142,15 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
     company_meta, w_meta = safe_request(crawler.get_company_overview_meta, symbol)
 
     if symbol.upper() in debug_symbols:
-        log(f"[{symbol}] company_meta={company_meta} warnings={w_meta}")
+        logger.info(f"[{symbol}] company_meta={company_meta} warnings={w_meta}")
 
     # --- MAP TO DTOs AND PUSH TO JAVA BACKEND ---
     client = JavaBackendClient()
 
     async def push_all():
+        def f(v):
+            return float(v) if v is not None else None
+
         balance_sheets = []
         income_stmts = []
         financial_inds = []
@@ -175,10 +179,6 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
         # Process Financial Indicators (separate logic for BANK vs NON-BANK)
         if inds:
             for ind in inds:
-                # Helper: convert optional numeric to float (keeps 0 values)
-                def f(v):
-                    return float(v) if v is not None else None
-
                 base_dto = {
                     "companyId": symbol,
                     "year": ind.year if hasattr(ind, "year") else 2026,
@@ -206,9 +206,6 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
         # Process Income Statements
         if incomes:
             for inc in incomes:
-                def f(v):
-                    return float(v) if v is not None else None
-
                 if is_bank:
                     # Map only fields that exist in Java DTO to avoid unknown-property issues
                     dto = {
@@ -242,9 +239,6 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
         # Process Balance Sheets
         if balances:
             for bal in balances:
-                def f(v):
-                    return float(v) if v is not None else None
-
                 if is_bank:
                     dto = {
                         "companyId": symbol,
@@ -342,10 +336,10 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
         errors.append(f"Push to DB failed: {str(push_err)}")
 
     if not errors:
-        log(f"✅ {symbol} CRAWL AND SYNC SUCCESS")
+        logger.info(f"✅ {symbol} CRAWL AND SYNC SUCCESS")
         return symbol, True, None
     else:
-        log(f"❌ {symbol} FAILED: {errors}")
+        logger.info(f"❌ {symbol} FAILED: {errors}")
         return symbol, False, errors
 
 
@@ -388,7 +382,7 @@ def get_market_symbols() -> list[tuple[str, bool]]:
         "TIN",
     }
 
-    log("Đang tải danh sách 1600+ mã chứng khoán từ HOSE, HNX, UPCOM...")
+    logger.info("Đang tải danh sách 1600+ mã chứng khoán từ HOSE, HNX, UPCOM...")
     try:
         listing = Listing(source="VCI")
 
@@ -428,14 +422,14 @@ def get_market_symbols() -> list[tuple[str, bool]]:
             unique_tickers[s] = exc
 
         final_list = list(unique_tickers.items())
-        log(f"✅ Tải thành công {len(final_list)} mã chứng khoán!")
+        logger.info(f"✅ Tải thành công {len(final_list)} mã chứng khoán!")
 
         # Map thành tuple (symbol, is_bank, exchange)
         return [(t, t in bank_symbols, exc) for t, exc in final_list]
 
     except Exception as e:
-        log(f"❌ Lỗi khi lấy danh sách mã toàn thị trường: {e}")
-        log("⚠️ Đang fallback về danh sách mặc định (VN30)...")
+        logger.info(f"❌ Lỗi khi lấy danh sách mã toàn thị trường: {e}")
+        logger.info("⚠️ Đang fallback về danh sách mặc định (VN30)...")
         # Fallback list just in case standard API fails
         return [
             ("FPT", False, "HOSE"),
@@ -458,22 +452,22 @@ def run_batch_crawl():
         tree = build_industry_node_payloads()
         if tree:
             asyncio.run(client.push_data("industry-nodes", tree))
-            log(f"✅ Đã đồng bộ {len(tree)} nút industry-nodes.")
+            logger.info(f"✅ Đã đồng bộ {len(tree)} nút industry-nodes.")
     except Exception as e:
-        log(f"⚠️ Không đồng bộ được industry-nodes (tiếp tục crawl): {e}")
+        logger.info(f"⚠️ Không đồng bộ được industry-nodes (tiếp tục crawl): {e}")
 
     companies_payload = [
         CompanyModel(id=sym, exchange=exc, companyType="BANK" if is_bank else "NON_BANK").model_dump()
         for sym, is_bank, exc in symbols_to_crawl
     ]
-    log(
+    logger.info(
         f"Đẩy toàn bộ {len(companies_payload)} mã Công ty (Master Data) lên Backend trước để tránh rác FK..."
     )
     try:
         asyncio.run(client.push_data("companies", companies_payload))
-        log("✅ Đẩy Master Data Company thành công!")
+        logger.info("✅ Đẩy Master Data Company thành công!")
     except Exception as e:
-        log(f"❌ Lỗi khi đẩy Master Data Company. Dừng Crawler: {e}")
+        logger.info(f"❌ Lỗi khi đẩy Master Data Company. Dừng Crawler: {e}")
         return
 
     state = load_state()
@@ -481,12 +475,12 @@ def run_batch_crawl():
 
     # Lọc bỏ các mã đã crawl thành công
     pending_symbols = [s for s in symbols_to_crawl if s[0] not in successful_list]
-    log(
+    logger.info(
         f"Tổng số mã: {len(symbols_to_crawl)}. Đã xong: {len(successful_list)}. Còn lại: {len(pending_symbols)}"
     )
 
     if not pending_symbols:
-        log("🎉 Tất cả các mã đã được crawl thành công!")
+        logger.info("🎉 Tất cả các mã đã được crawl thành công!")
         return
 
     failed_report = {}
@@ -511,10 +505,10 @@ def run_batch_crawl():
                     else:
                         failed_report[sym] = errors
                 except Exception as exc:
-                    log(f"Tiến trình crash cho một mã: {exc}")
+                    logger.info(f"Tiến trình crash cho một mã: {exc}")
 
     if failed_report:
-        log(f"⚠️ Có {len(failed_report)} mã thất bại. Danh sách: {list(failed_report.keys())}")
+        logger.info(f"⚠️ Có {len(failed_report)} mã thất bại. Danh sách: {list(failed_report.keys())}")
         with open("failed_report.json", "w", encoding="utf-8") as f:
             json.dump(failed_report, f, ensure_ascii=False, indent=4)
 

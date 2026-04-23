@@ -10,28 +10,29 @@ import httpx
 from app.core.config import settings
 from app.core.http_client import get_http_client
 from app.services.chat.utils.math_helpers import as_float, safe_mean, safe_median
-from app.services.forecast_tool_service import ForecastToolService
 
 logger = logging.getLogger(__name__)
 
 
 class MarketDataToolClient:
-    def __init__(self) -> None:
-        self.base_url = (settings.JAVA_BACKEND_URL or "http://localhost:8080/api/internal").rstrip("/")
+    def __init__(self, forecast_service: Any = None) -> None:
+        self.base_url = settings.JAVA_BACKEND_URL.rstrip("/")
         self.internal_api_key = (settings.INTERNAL_API_KEY or "").strip()
         self.timeout_seconds = max(5, int(settings.CHAT_TOOL_TIMEOUT_SECONDS))
-        self.forecast_tool_service = ForecastToolService()
+        self._forecast_service = forecast_service
         self.debug_log_prompts = bool(settings.CHAT_DEBUG_LOG_PROMPTS)
         self.debug_log_max_chars = max(500, int(settings.CHAT_DEBUG_LOG_MAX_CHARS))
 
-    async def execute_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not tool_calls:
-            return []
-        tasks = [self.execute_tool_call(call.get("name", ""), call.get("arguments") or {}) for call in tool_calls]
-        return await asyncio.gather(*tasks)
+    @property
+    def forecast_tool_service(self) -> Any:
+        if self._forecast_service is None:
+            from app.services.forecast_service import ForecastToolService
+            self._forecast_service = ForecastToolService()
+        return self._forecast_service
 
     async def execute_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if (tool_name or "").strip() == "get_company_forecast":
+        name = (tool_name or "").strip()
+        if name == "get_company_forecast":
             symbol = arguments.get("symbol")
             target_year = arguments.get("targetYear")
             result = await asyncio.to_thread(
@@ -48,17 +49,17 @@ class MarketDataToolClient:
             return result
 
         try:
-            method, path, params = self._build_request(tool_name, arguments)
+            method, path, params = self._build_request(name, arguments)
         except Exception as exc:
             result = {
-                "name": tool_name,
+                "name": name,
                 "ok": False,
                 "data": None,
                 "error_code": "INVALID_TOOL_ARGS",
                 "error_message": str(exc),
                 "source_refs": [],
             }
-            self._debug_log_tool(str(tool_name), arguments, result)
+            self._debug_log_tool(name, arguments, result)
             return result
 
         headers: dict[str, str] = {}
@@ -76,47 +77,48 @@ class MarketDataToolClient:
 
             if response.status_code < 200 or response.status_code >= 300:
                 result = {
-                    "name": tool_name,
+                    "name": name,
                     "ok": False,
                     "data": None,
                     "error_code": f"HTTP_{response.status_code}",
                     "error_message": response.text[:500],
                     "source_refs": [],
                 }
-                self._debug_log_tool(str(tool_name), arguments, result)
+                self._debug_log_tool(name, arguments, result)
                 return result
 
             try:
                 payload = response.json()
             except Exception:
+                logger.warning("Failed to parse JSON from tool %s response", name)
                 payload = {"raw": response.text}
 
-            if (tool_name or "").strip() == "get_company_live_valuation_snapshot":
+            if name == "get_company_live_valuation_snapshot":
                 payload = self._extract_live_valuation_snapshot(
                     symbol=str(arguments.get("symbol") or "").strip().upper(),
                     payload=payload,
                 )
 
-            if (tool_name or "").strip() == "get_company_metrics":
+            if name == "get_company_metrics":
                 payload = self._extract_company_metrics(payload)
 
-            # Always summarize daily valuations to save tokens — no need for flag
-            if (tool_name or "").strip() == "get_company_daily_valuations":
+            if name == "get_company_daily_valuations":
                 payload = self._summarize_daily_valuations(payload)
 
             result = {
-                "name": tool_name,
+                "name": name,
                 "ok": True,
                 "data": payload,
                 "error_code": None,
                 "error_message": None,
                 "source_refs": [],
             }
-            self._debug_log_tool(str(tool_name), arguments, result)
+            self._debug_log_tool(name, arguments, result)
             return result
         except Exception as exc:
+            logger.exception("Tool %s upstream error", name)
             result = {
-                "name": tool_name,
+                "name": name,
                 "ok": False,
                 "data": None,
                 "error_code": "TOOL_UPSTREAM_ERROR",
@@ -235,7 +237,7 @@ class MarketDataToolClient:
     def _debug_log_tool(self, name: str, args: dict[str, Any], result: dict[str, Any]) -> None:
         if not self.debug_log_prompts:
             return
-        logger.warning(
+        logger.debug(
             "[CHAT][TOOL][%s] args=%s result=%s",
             name,
             self._truncate(json.dumps(args, ensure_ascii=False)),

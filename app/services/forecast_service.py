@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +11,9 @@ from typing import Any
 import pandas as pd
 
 from app.core.config import settings
+from app.services.chat.utils.math_helpers import as_int, as_float
+
+logger = logging.getLogger(__name__)
 
 
 class ForecastToolService:
@@ -27,13 +32,21 @@ class ForecastToolService:
         normalized_symbol = (symbol or "").strip().upper()
         if not normalized_symbol:
             return self._error("INVALID_ARGS", "symbol is required")
+        if not re.fullmatch(r"[A-Z0-9]{1,10}", normalized_symbol):
+            return self._error("INVALID_SYMBOL", f"Invalid symbol format: {symbol}")
 
         if not self.enabled:
             return self._error("FORECAST_DISABLED", "Forecast tool is disabled")
 
         summary_payload = self._read_summary_json()
         default_year = self._extract_predict_year(summary_payload)
-        effective_year = int(target_year) if isinstance(target_year, int) else default_year
+        if target_year is not None:
+            try:
+                effective_year = int(target_year)
+            except (TypeError, ValueError):
+                effective_year = default_year
+        else:
+            effective_year = default_year
 
         forecast_rows, source_ref, load_error = self._load_forecast_rows()
         if not forecast_rows:
@@ -48,7 +61,7 @@ class ForecastToolService:
                     item=on_demand_row,
                     summary_payload=summary_payload,
                     source_ref=on_demand_ref,
-                    model_version="final_model_pipeline_v1_on_demand",
+                    model_version="production_pipeline_v1_on_demand",
                 )
             missing_symbols = self._extract_missing_symbols(summary_payload)
             if missing_symbols:
@@ -79,7 +92,7 @@ class ForecastToolService:
                     item=on_demand_row,
                     summary_payload=summary_payload,
                     source_ref=on_demand_ref,
-                    model_version="final_model_pipeline_v1_on_demand",
+                    model_version="production_pipeline_v1_on_demand",
                 )
             if on_demand_err:
                 return self._error(
@@ -95,7 +108,7 @@ class ForecastToolService:
             item=item,
             summary_payload=summary_payload,
             source_ref=source_ref,
-            model_version="final_model_pipeline_v1",
+            model_version="production_pipeline_v1",
         )
 
     def _build_success_payload(
@@ -161,7 +174,8 @@ class ForecastToolService:
         try:
             payload = json.loads(self.summary_json.read_text(encoding="utf-8"))
             return payload if isinstance(payload, dict) else {}
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to read summary JSON %s: %s", self.summary_json, exc)
             return {}
 
     @staticmethod
@@ -315,10 +329,20 @@ class ForecastToolService:
             target_rows = df.sort_values("_year").tail(1)
         target = target_rows.iloc[-1]
 
-        base_rows = df[df.get(cols.get("source"), pd.Series(dtype=str)).astype(str).str.lower().eq("base")] if "source" in cols else pd.DataFrame()
-        if base_rows.empty:
-            base_rows = df.sort_values("_year").head(1)
-        base = base_rows.iloc[-1] if not base_rows.empty else target
+        base = target
+        source_col = cols.get("source")
+        if source_col and source_col in df.columns:
+            base_rows = df[df[source_col].astype(str).str.lower().eq("base")]
+            if not base_rows.empty:
+                base = base_rows.iloc[-1]
+            else:
+                earlier = df[df["_year"] < int(target_year)]
+                if not earlier.empty:
+                    base = earlier.sort_values("_year").iloc[-1]
+        else:
+            earlier = df[df["_year"] < int(target_year)]
+            if not earlier.empty:
+                base = earlier.sort_values("_year").iloc[-1]
 
         row = {
             "symbol": symbol.upper(),
@@ -379,7 +403,8 @@ class ForecastToolService:
             return {}
         try:
             df = pd.read_csv(csv_path)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to read feature drivers CSV %s: %s", csv_path, exc)
             return {}
         if df.empty:
             return {}
@@ -404,7 +429,7 @@ class ForecastToolService:
                 if not sliced.empty:
                     work = sliced
                     selected_year = int(target_year)
-            if "_pred_year" in work.columns and work["_pred_year"].notna().any():
+            if selected_year is None and "_pred_year" in work.columns and work["_pred_year"].notna().any():
                 max_year = int(work["_pred_year"].max())
                 work = work[work["_pred_year"] == max_year]
                 selected_year = max_year
@@ -600,23 +625,8 @@ class ForecastToolService:
             return with_year[-1]
         return rows[-1]
 
-    @staticmethod
-    def _to_int(value: Any) -> int | None:
-        try:
-            if value is None:
-                return None
-            if isinstance(value, str) and not value.strip():
-                return None
-            return int(float(value))
-        except Exception:
-            return None
-
-    @staticmethod
-    def _to_float(value: Any) -> float | None:
-        try:
-            return float(value)
-        except Exception:
-            return None
+    _to_int = staticmethod(as_int)
+    _to_float = staticmethod(as_float)
 
     @staticmethod
     def _error(code: str, message: str) -> dict[str, Any]:

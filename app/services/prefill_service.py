@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
 from app.core.config import settings
-from app.domain.entities.transaction_prefill import (
+from app.models.transaction import (
     TransactionPrefillRequest,
     TransactionPrefillResponse,
 )
-from app.services.chat.llm_client import LLMClient
+from app.infrastructure.llm_client import LLMClient
+
+logger = logging.getLogger(__name__)
 
 
 class TransactionPrefillService:
@@ -91,6 +94,7 @@ class TransactionPrefillService:
         try:
             return ZoneInfo(timezone_name)
         except Exception:
+            logger.warning("Invalid timezone '%s', falling back to UTC", timezone_name)
             return ZoneInfo("UTC")
 
     def _normalize_output(
@@ -128,18 +132,16 @@ class TransactionPrefillService:
 
         output.confidence = max(0.0, min(1.0, float(output.confidence or 0.0)))
 
-        # Re-evaluate missing fields
-        missing.clear()
-        if output.amount is None:
-            missing.append("amount")
-        if output.type is None:
-            missing.append("type")
-        if output.categoryId is None:
-            missing.append("categoryId")
-        if output.accountId is None:
-            missing.append("accountId")
-        if output.transactionDate is None:
-            missing.append("transactionDate")
+        required_checks = {
+            "amount": output.amount,
+            "type": output.type,
+            "categoryId": output.categoryId,
+            "accountId": output.accountId,
+            "transactionDate": output.transactionDate,
+        }
+        for field_name, value in required_checks.items():
+            if value is None and field_name not in missing:
+                missing.append(field_name)
             
         output.missingFields = missing
         output.warnings = warnings[:10]

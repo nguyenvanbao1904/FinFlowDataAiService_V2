@@ -19,11 +19,12 @@ Suy luận cha (khi mã là 4-digit):
 from __future__ import annotations
 
 import logging
-import os
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import requests
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ def icb_node_uuid(icb_code: str) -> str:
     return str(uuid.uuid5(_ICB_NODE_NS, icb_code.strip()))
 
 
-def _normalize_api_item(obj: Dict[str, Any]) -> Optional[Tuple[str, int, str]]:
+def _normalize_api_item(obj: dict[str, Any]) -> tuple[str, int, str] | None:
     """
     Chuẩn hoá item từ FireAnt ``/industries`` hoặc fallback.
     Trả về: (industryCode/icbCode, level, name).
@@ -61,14 +62,14 @@ def _normalize_api_item(obj: Dict[str, Any]) -> Optional[Tuple[str, int, str]]:
     return c, lv, n
 
 
-def fetch_icb_rows_from_fireant() -> List[Tuple[str, int, str]]:
+def fetch_icb_rows_from_fireant() -> list[tuple[str, int, str]]:
     """
     FireAnt: dùng ``GET /industries`` để lấy mã 4-digit khớp với ``profile.icbCode``.
     """
-    token = (os.getenv("FIREANT_ACCESS_TOKEN") or os.getenv("FIREANT_BEARER_TOKEN") or "").strip()
+    token = settings.FIREANT_ACCESS_TOKEN.strip()
     if not token:
         return []
-    base = os.getenv("FIREANT_API_BASE", "https://restv2.fireant.vn").rstrip("/")
+    base = settings.FIREANT_API_BASE.rstrip("/")
     url = f"{base}/industries"
     try:
         r = requests.get(
@@ -90,7 +91,7 @@ def fetch_icb_rows_from_fireant() -> List[Tuple[str, int, str]]:
     else:
         raw_list = []
 
-    out: List[Tuple[str, int, str]] = []
+    out: list[tuple[str, int, str]] = []
     for item in raw_list:
         if not isinstance(item, dict):
             continue
@@ -100,14 +101,14 @@ def fetch_icb_rows_from_fireant() -> List[Tuple[str, int, str]]:
     return out
 
 
-def fetch_icb_rows_from_vci() -> List[Tuple[str, int, str]]:
+def fetch_icb_rows_from_vci() -> list[tuple[str, int, str]]:
     from vnstock import Listing
 
     listing = Listing(source="VCI")
     df = listing.industries_icb(show_log=False)
     if df is None or len(df) == 0:
         return []
-    out: List[Tuple[str, int, str]] = []
+    out: list[tuple[str, int, str]] = []
     for _, row in df.iterrows():
         code = str(row.get("icb_code", "")).strip()
         name = str(row.get("icb_name", "")).strip()
@@ -121,9 +122,9 @@ def fetch_icb_rows_from_vci() -> List[Tuple[str, int, str]]:
 
 
 def _longest_prefix_parent(
-    child_code: str, child_level: int, nodes: List[Dict[str, Any]]
-) -> Optional[str]:
-    best: Optional[str] = None
+    child_code: str, child_level: int, nodes: list[dict[str, Any]]
+) -> str | None:
+    best: str | None = None
     best_len = -1
     for n in nodes:
         if n["level"] >= child_level:
@@ -135,7 +136,7 @@ def _longest_prefix_parent(
     return best
 
 
-def _infer_parent_code_by_level(code: str, level: int) -> Optional[str]:
+def _infer_parent_code_by_level(code: str, level: int) -> str | None:
     """
     FireAnt ``/industries``: mã luôn là 4-digit theo format level.
     """
@@ -153,8 +154,8 @@ def _infer_parent_code_by_level(code: str, level: int) -> Optional[str]:
     return None
 
 
-def build_industry_node_payloads() -> List[Dict[str, Any]]:
-    token = (os.getenv("FIREANT_ACCESS_TOKEN") or os.getenv("FIREANT_BEARER_TOKEN") or "").strip()
+def build_industry_node_payloads() -> list[dict[str, Any]]:
+    token = settings.FIREANT_ACCESS_TOKEN.strip()
     if token:
         rows = fetch_icb_rows_from_fireant()
         source = "fireant"
@@ -173,18 +174,18 @@ def build_industry_node_payloads() -> List[Dict[str, Any]]:
 
     # dedupe by code (keep first)
     seen: set[str] = set()
-    uniq: List[Tuple[str, int, str]] = []
+    uniq: list[tuple[str, int, str]] = []
     for code, lv, name in sorted(rows, key=lambda x: (x[1], x[0])):
         if code in seen:
             continue
         seen.add(code)
         uniq.append((code, lv, name))
 
-    nodes: List[Dict[str, Any]] = [
+    nodes: list[dict[str, Any]] = [
         {"code": c, "level": lv, "nameVi": n} for c, lv, n in uniq
     ]
 
-    payloads: List[Dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
     code_set = {n["code"] for n in nodes}
     for n in nodes:
         parent_code = _infer_parent_code_by_level(n["code"], n["level"])

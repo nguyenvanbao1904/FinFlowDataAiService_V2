@@ -29,14 +29,14 @@ import httpx
 
 from app.core.config import settings
 from app.core.http_client import get_http_client
-from app.domain.entities.chat_orchestrator import (
+from app.models.chat import (
     ChatCitation,
     ChatOrchestrateRequest,
     ChatOrchestrateResponse,
     ThreadSummaryRequest,
     ThreadSummaryResponse,
 )
-from app.services.chat.llm_client import LLMClient, LLMToolResponse, ToolCallInfo, _accumulate_usage
+from app.infrastructure.llm_client import LLMClient, LLMToolResponse, ToolCallInfo, _accumulate_usage
 from app.services.chat.prompts.agent_prompt import AGENT_SYSTEM_PROMPT
 from app.services.chat.tool_registry import (
     LOCAL_TOOL_NAME,
@@ -48,8 +48,8 @@ from app.services.chat.tool_registry import (
 from app.services.chat.tracing import RequestTrace
 from app.services.chat.utils.vietnamese_text import sanitize_user_facing_message
 from app.services.chat.valuation_engine import compute_fair_value
-from app.services.market_data_tool_client import MarketDataToolClient
-from app.services.rag_retrieval_service import RagRetrievalService
+from app.infrastructure.market_data_client import MarketDataToolClient
+from app.infrastructure.rag_client import RagRetrievalService
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ class ChatOrchestrator:
             clarification_question=(
                 assistant_message if needs_clarification else None
             ),
-            provider="deepseek",
+            provider=self._llm.model.split("-")[0] if self._llm.model else "deepseek",
             model=self._llm.model,
             input_tokens=accumulated_usage["input_tokens"],
             output_tokens=accumulated_usage["output_tokens"],
@@ -238,9 +238,10 @@ class ChatOrchestrator:
             f"LUÔN TUÂN THỦ NGÀY GIỜ NÀY. Nếu user hỏi 'hôm qua', hãy lùi 1 ngày so với ngày hiện tại này."
         )
         if request.context_summary and request.context_summary.strip():
+            summary = request.context_summary.strip()[:2000]
             system_content += (
                 f"\n\nContext từ cuộc hội thoại trước: "
-                f"{request.context_summary}"
+                f"{summary}"
             )
 
         messages: list[dict[str, Any]] = [
@@ -346,14 +347,6 @@ class ChatOrchestrator:
     ) -> dict[str, Any]:
         """Execute compute_fair_value: self-fetch data + deterministic computation."""
         try:
-            if tc.name != LOCAL_TOOL_NAME:
-                return {
-                    "name": tc.name, "ok": False, "data": None,
-                    "error_code": "UNKNOWN_LOCAL",
-                    "error_message": f"Unknown local tool: {tc.name}",
-                    "source_refs": [],
-                }
-
             symbol = (tc.arguments.get("symbol") or "").strip().upper()
             if not symbol:
                 return {
@@ -410,8 +403,8 @@ class ChatOrchestrator:
             }
 
         try:
-            base_url = (settings.JAVA_BACKEND_URL or "http://localhost:8080/api/internal").rstrip("/")
-            internal_key = (settings.INTERNAL_API_KEY or "").strip()
+            base_url = settings.JAVA_BACKEND_URL.rstrip("/")
+            internal_key = settings.INTERNAL_API_KEY.strip()
 
             headers: dict[str, str] = {}
             if internal_key:
@@ -624,7 +617,7 @@ class ChatOrchestrator:
             if isinstance(target_year, int):
                 years.append(target_year)
 
-        ticker = next(iter(tickers)) if len(tickers) == 1 else None
+        ticker = ",".join(sorted(tickers)) if tickers else None
         year = max(years) if years else None
         return ticker, year
 
@@ -715,7 +708,7 @@ class ChatOrchestrator:
             current_period=(
                 int(current_period) if isinstance(current_period, int) else None
             ),
-            provider="deepseek",
+            provider=self._llm.model.split("-")[0] if self._llm.model else "deepseek",
             model=self._llm.model,
             input_tokens=usage["input_tokens"],
             output_tokens=usage["output_tokens"],

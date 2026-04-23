@@ -80,32 +80,3 @@ def fmt_ty(value: float | None, *, already_ty: bool = False) -> str:
     return f"{ty:,.1f} tỷ đồng"
 
 
-def normalize_cplh_to_billion(value: float | None) -> float | None:
-    """Normalize cổ phiếu lưu hành to tỷ cổ phiếu (handle various unit scales)."""
-    if value is None:
-        return None
-    v = abs(float(value))
-    if v >= 1_000_000:
-        return float(value) / 1_000_000_000.0
-    if v >= 1_000:
-        return float(value) / 1_000.0
-    return float(value)
-
-
-def build_metric_status(
-    current: float | None,
-    ref_mean: float | None,
-    ref_median: float | None,
-) -> dict[str, Any]:
-    """Build a single metric comparison dict (PE, PB, or PS)."""
-    diff_mean = pct_diff(current, ref_mean)
-    diff_median = pct_diff(current, ref_median)
-    return {
-        "current": current,
-        "ref_mean": ref_mean,
-        "ref_median": ref_median,
-        "diff_vs_mean_pct": diff_mean,
-        "diff_vs_median_pct": diff_median,
-        "status_vs_mean": valuation_status_label(diff_mean),
-        "status_vs_median": valuation_status_label(diff_median),
-    }

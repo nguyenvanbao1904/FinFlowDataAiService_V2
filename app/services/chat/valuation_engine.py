@@ -166,7 +166,7 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
 
         # ── Use forward EPS if forecast available ──
         forward_eps = eps
-        if forecast_profit and cplh and cplh > 0:
+        if forecast_profit is not None and cplh and cplh > 0:
             # forecast_profit is in tỷ đồng, convert to đồng
             forecast_profit_dong = float(forecast_profit) * 1e9
             forward_eps = forecast_profit_dong / float(cplh)

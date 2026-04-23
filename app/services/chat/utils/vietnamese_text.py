@@ -62,7 +62,6 @@ _FUZZY_LABELS: list[tuple[str, str]] = [
     ("interbank", "quy mô cho vay/đặt vốn liên ngân hàng"),
     ("fee", "thu nhập từ phí dịch vụ"),
     ("commission", "thu nhập từ phí dịch vụ"),
-    ("other_income", "thu nhập ngoài lãi"),
     ("gdp", "bối cảnh kinh tế vĩ mô"),
     ("macro", "bối cảnh kinh tế vĩ mô"),
     ("profit", "mặt bằng lợi nhuận nền"),
@@ -87,16 +86,6 @@ def feature_label_vi(feature_name: str) -> str:
         if substr in key:
             return label
     return "một số chỉ tiêu tài chính nội tại khác"
-
-
-def impact_level_vi(abs_score: float | None) -> str:
-    """Classify SHAP/importance score into Vietnamese impact level."""
-    s = abs(abs_score or 0.0)
-    if s >= 0.04:
-        return "mạnh"
-    if s >= 0.02:
-        return "vừa"
-    return "nhẹ"
 
 
 def sanitize_user_facing_message(text: str) -> str:

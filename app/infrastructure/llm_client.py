@@ -141,12 +141,13 @@ class LLMClient:
                     stage, attempt + 1, max_retries + 1, last_error,
                 )
 
-        # All retries exhausted — return default instance.
         logger.error(
-            "[CHAT][%s] All %d attempts failed, returning default %s",
-            stage, max_retries + 1, response_model.__name__,
+            "[CHAT][%s] All %d attempts failed for %s. Last error: %s",
+            stage, max_retries + 1, response_model.__name__, last_error,
         )
-        return response_model(), accumulated_usage
+        raise RuntimeError(
+            f"LLM structured call failed after {max_retries + 1} attempts: {last_error}"
+        )
 
     async def call_json(
         self,
@@ -222,46 +223,16 @@ class LLMClient:
 
         if self.debug_log_prompts:
             last_msg = messages[-1] if messages else {}
-            logger.warning(
+            logger.debug(
                 "[CHAT][%s] %d messages, last_role=%s, %d tools",
                 stage, len(messages), last_msg.get("role", "?"), len(tools or []),
             )
 
-        last_exception: BaseException | None = None
-        timeout = httpx.Timeout(self.timeout_seconds)
-        client = get_http_client()
-
-        for attempt in range(max_retries + 1):
-            try:
-                response = await client.post(
-                    endpoint, headers=headers, json=payload, timeout=timeout,
-                )
-
-                if response.status_code in _RETRYABLE_STATUS_CODES and attempt < max_retries:
-                    wait = min(2 ** attempt, 8)
-                    logger.warning(
-                        "[CHAT][%s] HTTP %d, retrying in %ds (attempt %d/%d)",
-                        stage, response.status_code, wait, attempt + 1, max_retries + 1,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-
-                response.raise_for_status()
-                body = response.json() if response.content else {}
-                return self._parse_tool_response(body, stage)
-
-            except (httpx.TimeoutException, httpx.ConnectError) as exc:
-                last_exception = exc
-                if attempt < max_retries:
-                    wait = min(2 ** attempt, 8)
-                    logger.warning(
-                        "[CHAT][%s] %s, retrying in %ds (attempt %d/%d)",
-                        stage, type(exc).__name__, wait, attempt + 1, max_retries + 1,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-
-        raise last_exception or RuntimeError(f"LLM call failed after {max_retries + 1} attempts")
+        body = await self._post_with_retry(
+            endpoint=endpoint, headers=headers, payload=payload,
+            stage=stage, max_retries=max_retries,
+        )
+        return self._parse_tool_response(body, stage)
 
     def _parse_tool_response(self, body: dict[str, Any], stage: str) -> LLMToolResponse:
         """Parse OpenAI-compatible response into LLMToolResponse."""
@@ -293,17 +264,18 @@ class LLMClient:
             ))
 
         if reasoning_content and self.debug_log_prompts:
-            logger.warning("[CHAT][%s] REASONING: %s", stage, reasoning_content)
+            logger.debug("[CHAT][%s] REASONING: %s", stage, reasoning_content)
 
         if self.debug_log_prompts:
             if tool_calls:
                 tc_summary = ", ".join(f"{tc.name}({tc.arguments})" for tc in tool_calls)
-                logger.warning("[CHAT][%s] TOOL_CALLS: %s", stage, self._truncate(tc_summary))
+                logger.debug("[CHAT][%s] TOOL_CALLS: %s", stage, self._truncate(tc_summary))
             elif content:
-                logger.warning("[CHAT][%s] CONTENT: %s", stage, self._truncate(content))
+                logger.debug("[CHAT][%s] CONTENT: %s", stage, self._truncate(content))
 
         return LLMToolResponse(
             content=content,
+            reasoning_content=reasoning_content,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
@@ -348,6 +320,33 @@ class LLMClient:
         else:
             payload["response_format"] = {"type": "json_object"}
 
+        body = await self._post_with_retry(
+            endpoint=endpoint, headers=headers, payload=payload,
+            stage=stage, max_retries=max_retries,
+            fallback_on_400=True,
+        )
+
+        reasoning = self._extract_reasoning_content(body)
+        if reasoning and self.debug_log_prompts:
+            logger.debug("[CHAT][%s] REASONING: %s", stage, self._truncate(reasoning))
+
+        text = self._extract_message_content(body)
+        self._log_raw_response(stage=stage, text=text)
+        usage = self._extract_usage(body)
+        return text, usage
+
+    # ── HTTP retry ────────────────────────────────────────────────────
+
+    async def _post_with_retry(
+        self,
+        *,
+        endpoint: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        stage: str,
+        max_retries: int,
+        fallback_on_400: bool = False,
+    ) -> dict[str, Any]:
         last_exception: BaseException | None = None
         timeout = httpx.Timeout(self.timeout_seconds)
         client = get_http_client()
@@ -358,8 +357,7 @@ class LLMClient:
                     endpoint, headers=headers, json=payload, timeout=timeout,
                 )
 
-                # Handle response_format rejection (some endpoints don't support it).
-                if response.status_code in {400, 422}:
+                if fallback_on_400 and response.status_code in {400, 422}:
                     fallback_payload = dict(payload)
                     fallback_payload.pop("response_format", None)
                     response = await client.post(
@@ -376,16 +374,7 @@ class LLMClient:
                     continue
 
                 response.raise_for_status()
-                body = response.json() if response.content else {}
-
-                reasoning = self._extract_reasoning_content(body)
-                if reasoning and self.debug_log_prompts:
-                    logger.warning("[CHAT][%s] REASONING: %s", stage, self._truncate(reasoning))
-
-                text = self._extract_message_content(body)
-                self._log_raw_response(stage=stage, text=text)
-                usage = self._extract_usage(body)
-                return text, usage
+                return response.json() if response.content else {}
 
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 last_exception = exc
@@ -409,7 +398,6 @@ class LLMClient:
         Handles:
         - Markdown code fences (```json ... ```)
         - Trailing commas
-        - Single quotes instead of double quotes
         - Missing outer braces
         """
         if not text or not text.strip():
@@ -503,12 +491,12 @@ class LLMClient:
     def _log_prompt(self, *, stage: str, prompt: str) -> None:
         if not self.debug_log_prompts:
             return
-        logger.warning("[CHAT][PROMPT][%s] %s", stage, self._truncate(prompt))
+        logger.debug("[CHAT][PROMPT][%s] %s", stage, self._truncate(prompt))
 
     def _log_raw_response(self, *, stage: str, text: str) -> None:
         if not self.debug_log_prompts:
             return
-        logger.warning("[CHAT][RESPONSE][%s] %s", stage, self._truncate(text))
+        logger.debug("[CHAT][RESPONSE][%s] %s", stage, self._truncate(text))
 
     def _truncate(self, text: str) -> str:
         if len(text) <= self.debug_log_max_chars:

@@ -4,12 +4,12 @@ import json
 import logging
 from typing import Any
 
-from app.domain.entities.analytics_insights import (
+from app.models.analytics import (
     AnalyticsInsightItem,
     AnalyticsInsightsRequest,
     AnalyticsInsightsResponse,
 )
-from app.services.chat.llm_client import LLMClient
+from app.infrastructure.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +20,15 @@ class AnalyticsInsightsService:
 
     async def generate(self, request: AnalyticsInsightsRequest) -> AnalyticsInsightsResponse:
         if not self._has_activity_in_last_two_months(request):
-            logger.warning("Analytics insights skip LLM: no activity in last 2 calendar months (monthlySeries)")
+            logger.info("Analytics insights skip LLM: no activity in last 2 calendar months (monthlySeries)")
             return self._insufficient_recent_data_response()
 
         try:
-            logger.warning("Analytics insights LLM call start: tier=%s", request.insightTier)
+            logger.info("Analytics insights LLM call start: tier=%s", request.insightTier)
             raw = await self._call_llm(request)
             response = self._normalize(raw, request)
             response.cached = False
-            logger.warning("Analytics insights LLM call success: insights=%d", len(response.insights))
+            logger.info("Analytics insights LLM call success: insights=%d", len(response.insights))
             return response
         except Exception as exc:
             logger.warning(
@@ -58,9 +58,8 @@ class AnalyticsInsightsService:
             stage="analytics",
             enable_thinking=False,  # Simple NLP task: fast, uses response_format=json_object
         )
-        logger.warning("Analytics LLM parsed keys=%s", list(parsed.keys()) if parsed else "EMPTY")
+        logger.info("Analytics LLM parsed keys=%s", list(parsed.keys()) if parsed else "EMPTY")
         return parsed
-
 
 
     def _build_prompt(self, request: AnalyticsInsightsRequest) -> str:
@@ -248,7 +247,7 @@ monthlySeries={json.dumps(monthly_series, ensure_ascii=False)}
                 )
                 real_count += 1
 
-        logger.warning("Analytics normalize: real_count=%d from LLM output", real_count)
+        logger.info("Analytics normalize: real_count=%d from LLM output", real_count)
         warning_present = any(i.type == "WARNING" for i in items)
         tip_present = any(i.type == "TIP" for i in items)
         if not warning_present:
@@ -286,8 +285,6 @@ monthlySeries={json.dumps(monthly_series, ensure_ascii=False)}
         raw_warnings = output.get("warnings")
         warnings = [str(w) for w in raw_warnings[:5]] if isinstance(raw_warnings, list) else []
         return AnalyticsInsightsResponse(insights=result, warnings=warnings, cached=False)
-
-
 
     @staticmethod
     def _has_activity_in_last_two_months(request: AnalyticsInsightsRequest) -> bool:
@@ -371,12 +368,6 @@ monthlySeries={json.dumps(monthly_series, ensure_ascii=False)}
             warnings=warnings,
             cached=cached,
         )
-
-    @staticmethod
-    def _truncate_for_log(value: str, max_chars: int) -> str:
-        if len(value) <= max_chars:
-            return value
-        return f"{value[:max_chars]}...(truncated {len(value) - max_chars} chars)"
 
     @staticmethod
     def _lookback_income(request: AnalyticsInsightsRequest) -> float:

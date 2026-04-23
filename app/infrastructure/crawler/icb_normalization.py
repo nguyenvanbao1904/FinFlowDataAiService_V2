@@ -2,29 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import math
+from typing import Any
 
-import pandas as pd
 
-
-def normalize_icb_code(val: Any) -> Optional[str]:
-    if val is None or pd.isna(val):
+def normalize_icb_code(val: Any) -> str | None:
+    if val is None:
         return None
     if isinstance(val, bool):
         return None
     if isinstance(val, int):
         return str(val)
     if isinstance(val, float):
-        if val != val:  # NaN
+        if math.isnan(val):
             return None
         if val == int(val):
             return str(int(val))
-        s = str(val).strip()
-        return s
+        return str(val).strip()
     s = str(val).strip()
     if not s:
         return None
-    # Chuỗi kiểu "50205040.0" hoặc "8,355" (hiếm)
     try:
         f = float(s.replace(",", ""))
         if f == int(f):

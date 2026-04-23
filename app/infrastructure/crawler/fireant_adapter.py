@@ -18,12 +18,12 @@ their access controls.
 from __future__ import annotations
 
 import logging
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import requests
 
-from app.services.icb_normalization import normalize_icb_code
+from app.core.config import settings
+from app.infrastructure.crawler.icb_normalization import normalize_icb_code
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ _MAX_DESCRIPTION_LEN = 2000
 _MAX_INDUSTRY_LABEL_LEN = 2000
 
 
-def _empty_meta() -> Dict[str, Optional[str]]:
+def empty_company_meta() -> dict[str, str | None]:
     return {
         "companyName": None,
         "industryLabelFull": None,
@@ -48,7 +48,7 @@ def _truncate(s: str, max_len: int, ellipsis: str = "…") -> str:
     return s[: max_len - 1].rstrip() + ellipsis
 
 
-def _strip_html(text: Optional[str]) -> Optional[str]:
+def _strip_html(text: str | None) -> str | None:
     if text is None:
         return None
     s = str(text).strip()
@@ -65,7 +65,7 @@ def _strip_html(text: Optional[str]) -> Optional[str]:
     return s if s else None
 
 
-def _business_areas_plain(raw: Optional[Any]) -> Optional[str]:
+def _business_areas_plain(raw: Any | None) -> str | None:
     """
     FireAnt ``businessAreas`` is often HTML (<ul><li>…</li>).
     Returns a single plain-text line (unbounded); caller truncates for DB columns.
@@ -75,7 +75,7 @@ def _business_areas_plain(raw: Optional[Any]) -> Optional[str]:
         return None
     lines = [ln.strip().rstrip(".").strip() for ln in plain.splitlines() if ln.strip()]
     seen: set[str] = set()
-    uniq: List[str] = []
+    uniq: list[str] = []
     for ln in lines:
         key = ln.lower()
         if key not in seen:
@@ -85,49 +85,47 @@ def _business_areas_plain(raw: Optional[Any]) -> Optional[str]:
     return joined if joined else None
 
 
-def fetch_fireant_company_meta(symbol: str) -> Tuple[Dict[str, Optional[str]], List[str]]:
+def fetch_fireant_company_meta(symbol: str) -> tuple[dict[str, str | None], list[str]]:
     """
     Returns companyName, industryLabelFull (for ``industries.label``), description, icbCode.
     If no token is configured, returns all-None dict and no warnings.
     """
-    token = (
-        os.getenv("FIREANT_ACCESS_TOKEN") or os.getenv("FIREANT_BEARER_TOKEN") or ""
-    ).strip()
+    token = settings.FIREANT_ACCESS_TOKEN.strip()
     if not token:
-        return _empty_meta(), []
+        return empty_company_meta(), []
 
-    base = (os.getenv("FIREANT_API_BASE") or "https://restv2.fireant.vn").rstrip("/")
+    base = settings.FIREANT_API_BASE.rstrip("/")
     url = f"{base}/symbols/{symbol.upper()}/profile"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "User-Agent": "FinFlow-data-crawler/1.0",
     }
-    warnings: List[str] = []
+    warnings: list[str] = []
     try:
         r = requests.get(url, headers=headers, timeout=30)
         if r.status_code == 401:
             warnings.append(
                 "FireAnt: 401 Unauthorized — kiểm tra FIREANT_ACCESS_TOKEN (scope symbols-read)."
             )
-            return _empty_meta(), warnings
+            return empty_company_meta(), warnings
         if r.status_code == 403:
             warnings.append(
                 "FireAnt: 403 Forbidden — token thiếu quyền symbols-read hoặc tài khoản bị chặn."
             )
-            return _empty_meta(), warnings
+            return empty_company_meta(), warnings
         r.raise_for_status()
         data: Any = r.json()
     except requests.RequestException as e:
         warnings.append(f"FireAnt: request failed: {e}")
-        return _empty_meta(), warnings
+        return empty_company_meta(), warnings
     except ValueError as e:
         warnings.append(f"FireAnt: invalid JSON: {e}")
-        return _empty_meta(), warnings
+        return empty_company_meta(), warnings
 
     if not isinstance(data, dict):
         warnings.append("FireAnt: unexpected response (not a JSON object)")
-        return _empty_meta(), warnings
+        return empty_company_meta(), warnings
 
     name = (data.get("companyName") or data.get("shortName") or "").strip() or None
     areas_plain = _business_areas_plain(data.get("businessAreas"))
@@ -140,7 +138,7 @@ def fetch_fireant_company_meta(symbol: str) -> Tuple[Dict[str, Optional[str]], L
     )
     icb_code = normalize_icb_code(icb_raw)
 
-    industry_label_full: Optional[str] = None
+    industry_label_full: str | None = None
     if areas_plain:
         industry_label_full = _truncate(areas_plain, _MAX_INDUSTRY_LABEL_LEN)
     elif icb_code:
@@ -153,7 +151,7 @@ def fetch_fireant_company_meta(symbol: str) -> Tuple[Dict[str, Optional[str]], L
     if not any([name, industry_label_full, desc, icb_code]):
         logger.debug("[%s] FireAnt profile returned empty name/industry/overview", symbol)
 
-    out = _empty_meta()
+    out = empty_company_meta()
     out.update(
         {
             "companyName": name,

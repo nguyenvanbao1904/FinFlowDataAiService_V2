@@ -4,7 +4,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.http_client import get_http_client
-from app.domain.ports.backend_sync_port import BackendSyncPort
+from app.infrastructure.ports.backend_sync_port import BackendSyncPort
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ class JavaBackendClient(BackendSyncPort):
     """Client to communicate with the internal FinFlow Java Backend."""
 
     def __init__(self) -> None:
-        self.base_url = settings.JAVA_BACKEND_URL or "http://localhost:8080/api/internal"
+        self.base_url = settings.JAVA_BACKEND_URL
         self.internal_api_key = settings.INTERNAL_API_KEY.strip()
 
     async def push_data(self, endpoint: str, data: list[dict]) -> int | None:

@@ -1,12 +1,15 @@
+from __future__ import annotations
+
 import logging
 import os
 import json
 import pandas as pd
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Any
 from vnstock import Company, Finance
-from app.services.fireant_profile import _empty_meta, fetch_fireant_company_meta
-from app.services.icb_normalization import normalize_icb_code
-from app.domain.entities.investment import (
+from app.core.config import settings
+from app.infrastructure.crawler.fireant_adapter import empty_company_meta, fetch_fireant_company_meta
+from app.infrastructure.crawler.icb_normalization import normalize_icb_code
+from app.models.investment import (
     BankFinancialIndicator, NonBankFinancialIndicator,
     NonBankIncomeStatement, NonBankBalanceSheet,
     BankIncomeStatement, BankBalanceSheet,
@@ -17,18 +20,18 @@ logger = logging.getLogger(__name__)
 
 
 def _merge_company_meta(
-    prefer: Dict[str, Optional[str]],
-    fill: Dict[str, Optional[str]],
-) -> Dict[str, Optional[str]]:
+    prefer: dict[str, str | None],
+    fill: dict[str, str | None],
+) -> dict[str, str | None]:
     """Prefer non-empty fields from ``prefer`` (e.g. FireAnt), then ``fill`` (vnstock VCI)."""
 
-    def norm(v: Any) -> Optional[str]:
+    def norm(v: Any) -> str | None:
         if v is None:
             return None
         s = str(v).strip()
         return s if s else None
 
-    def pick(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    def pick(a: str | None, b: str | None) -> str | None:
         return norm(a) or norm(b)
 
     return {
@@ -44,7 +47,7 @@ def _merge_company_meta(
 class AliasMapper:
     """Helper to extract values from pandas Series using multiple possible column names."""
     @staticmethod
-    def get_value(row: pd.Series, aliases: list[str]) -> float | None:
+    def get_value(row: pd.Series, aliases: list[str | tuple[str, ...]]) -> float | None:
         for alias in aliases:
             if alias in row.index and pd.notna(row[alias]):
                 return float(row[alias])
@@ -54,7 +57,7 @@ class VnstockCrawlerService:
     """Service for crawling financial data using vnstock library."""
 
     # ``Company.overview()`` VCI không có icb_code1..4; mã số chỉ có trong ``Listing.symbols_by_industries()``.
-    _listing_icb_by_symbol: Optional[Dict[str, str]] = None
+    _listing_icb_by_symbol: dict[str, str] | None = None
 
     @classmethod
     def _load_vci_listing_icb_cache(cls) -> None:
@@ -64,12 +67,12 @@ class VnstockCrawlerService:
 
         logger.info("Đang tải VCI symbols_by_industries (mã ICB theo ticker) — cache một lần / process…")
         df = Listing(source="VCI").symbols_by_industries(show_log=False)
-        m: Dict[str, str] = {}
+        m: dict[str, str] = {}
         for _, row in df.iterrows():
             sym = str(row.get("symbol", "")).strip().upper()
             if not sym:
                 continue
-            code: Optional[str] = None
+            code: str | None = None
             for col in ("icb_code4", "icb_code3", "icb_code2", "icb_code1"):
                 v = row.get(col)
                 if v is None or pd.isna(v):
@@ -83,9 +86,10 @@ class VnstockCrawlerService:
         logger.info("Đã cache ICB cho %d mã từ VCI listing.", len(m))
 
     @classmethod
-    def _get_icb_from_vci_listing(cls, symbol: str) -> Optional[str]:
+    def _get_icb_from_vci_listing(cls, symbol: str) -> str | None:
         cls._load_vci_listing_icb_cache()
-        assert cls._listing_icb_by_symbol is not None
+        if cls._listing_icb_by_symbol is None:
+            return None
         return cls._listing_icb_by_symbol.get(symbol.strip().upper())
 
     # Define aliases for fluctuating column names
@@ -140,10 +144,10 @@ class VnstockCrawlerService:
     IND_YEAR = [('Meta', 'Năm'), 'Năm']
     IND_QUARTER = [('Meta', 'Kỳ'), 'Kỳ']
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.mapper = AliasMapper()
 
-    def get_financial_indicators(self, symbol: str, is_bank: bool = False) -> Tuple[List[Any], List[str]]:
+    def get_financial_indicators(self, symbol: str, is_bank: bool = False) -> tuple[list[Any], list[str]]:
         """Returns (List of full historical quarters, List of missing fields if any)"""
         logger.info(f"Crawling indicators for {symbol}...")
         results = []
@@ -189,7 +193,7 @@ class VnstockCrawlerService:
         except Exception as e:
             return [], [f"Exception: {str(e)}"]
 
-    def get_income_statement(self, symbol: str, is_bank: bool = False) -> Tuple[List[Any], List[str]]:
+    def get_income_statement(self, symbol: str, is_bank: bool = False) -> tuple[list[Any], list[str]]:
         logger.info(f"Crawling Income Statement for {symbol}...")
         results = []
         warnings = []
@@ -231,7 +235,7 @@ class VnstockCrawlerService:
         except Exception as e:
             return [], [f"Exception: {str(e)}"]
 
-    def get_balance_sheet(self, symbol: str, is_bank: bool = False) -> Tuple[List[Any], List[str]]:
+    def get_balance_sheet(self, symbol: str, is_bank: bool = False) -> tuple[list[Any], list[str]]:
         logger.info(f"Crawling Balance Sheet for {symbol}...")
         results = []
         warnings = []
@@ -287,14 +291,14 @@ class VnstockCrawlerService:
         except Exception as e:
             return [], [f"Exception: {str(e)}"]
 
-    def _clean_date_str(self, val: Any) -> Optional[str]:
+    def _clean_date_str(self, val: Any) -> str | None:
         """Cleans pandas date columns to prevent empty string vs NaT bugs bridging to Java LocalDate"""
         if pd.isna(val) or val is None or str(val).strip() == "":
             return None
         # vnstock usually returns dates as "YYYY-MM-DD" strings in events
         return str(val).strip()
 
-    def _company_overview_meta_vci(self, symbol: str) -> Tuple[dict[str, Optional[str]], List[str]]:
+    def _company_overview_meta_vci(self, symbol: str) -> tuple[dict[str, str | None], list[str]]:
         """
         vnstock VCI `Company.overview()` → companyName / industry / synthetic description.
         """
@@ -303,7 +307,7 @@ class VnstockCrawlerService:
             company = Company(symbol=symbol, source="VCI")
             df = company.overview()
             if df is None or len(df) == 0:
-                return _empty_meta(), []
+                return empty_company_meta(), []
 
             row = df.iloc[0].to_dict()
 
@@ -340,7 +344,7 @@ class VnstockCrawlerService:
 
             # 1) industry
             # Prefer keys that contain "industry" but exclude "industry_id*" helpers.
-            industry: Optional[str] = None
+            industry: str | None = None
             industry_keys = [k for k in row_lc.keys() if "industry" in k and "industry_id" not in k]
             # Keep stable preference order (most likely keys first).
             industry_preferred = [
@@ -368,7 +372,7 @@ class VnstockCrawlerService:
                         break
 
             # ICB code + full label path (backend resolve → industry_nodes / companies.industry_node_id)
-            icb_code_v: Optional[str] = None
+            icb_code_v: str | None = None
             for k in [
                 "icb_code",
                 "icbid",
@@ -400,9 +404,7 @@ class VnstockCrawlerService:
             # Khi không dùng FireAnt: overview() thường không có cột mã — lấy từ CompaniesListingInfo (vnstock Listing).
             # Khi có FIREANT_ACCESS_TOKEN: không gán mã từ VCI listing (tránh lệch với cây ``GET /icb`` FireAnt).
             if not icb_code_v:
-                if not (
-                    (os.getenv("FIREANT_ACCESS_TOKEN") or os.getenv("FIREANT_BEARER_TOKEN") or "").strip()
-                ):
+                if not settings.FIREANT_ACCESS_TOKEN.strip():
                     icb_code_v = VnstockCrawlerService._get_icb_from_vci_listing(symbol)
 
             icb_parts: list[str] = []
@@ -414,7 +416,7 @@ class VnstockCrawlerService:
                     if t and t not in icb_parts:
                         icb_parts.append(t)
             icb_hierarchy = " > ".join(icb_parts) if icb_parts else None
-            industry_label_full_v: Optional[str] = icb_hierarchy
+            industry_label_full_v: str | None = icb_hierarchy
             if not industry_label_full_v and industry:
                 industry_label_full_v = industry
             if industry_label_full_v and len(industry_label_full_v) > 2000:
@@ -422,7 +424,7 @@ class VnstockCrawlerService:
 
             # 2) company name
             # Prefer explicit company name keys first; do not use generic "name" unless we must.
-            company_name: Optional[str] = None
+            company_name: str | None = None
             company_name_preferred = [
                 "short_name",
                 "company_name",
@@ -496,7 +498,7 @@ class VnstockCrawlerService:
 
                     # If still missing, recursively scan nested dicts/lists for likely keys.
                     if company_name is None:
-                        def find_in_obj(obj: Any, keys: list[str]) -> Optional[str]:
+                        def find_in_obj(obj: Any, keys: list[str]) -> str | None:
                             keys_lower = {k.lower() for k in keys}
                             if isinstance(obj, dict):
                                 for k, v in obj.items():
@@ -521,9 +523,9 @@ class VnstockCrawlerService:
             # 3) description (company intro):
             # vnstock `reports().description` thường là mô tả báo cáo phân tích/khuyến nghị,
             # không phải "giới thiệu công ty". Ở đây ta tạo "company bio" đơn giản từ overview.
-            description: Optional[str] = None
+            description: str | None = None
             try:
-                def pick_first(*cands: str) -> Optional[str]:
+                def pick_first(*cands: str) -> str | None:
                     for cand in cands:
                         v = row_lc.get(cand)
                         if not is_missing(v):
@@ -558,10 +560,10 @@ class VnstockCrawlerService:
                 "icbCode": icb_code_v,
             }, []
         except Exception as e:
-            m = _empty_meta()
+            m = empty_company_meta()
             return m, [f"Exception: {str(e)}"]
 
-    def get_company_overview_meta(self, symbol: str) -> Tuple[dict[str, Optional[str]], List[str]]:
+    def get_company_overview_meta(self, symbol: str) -> tuple[dict[str, str | None], list[str]]:
         """
         Company metadata for the backend ``companies`` table.
 
@@ -576,7 +578,7 @@ class VnstockCrawlerService:
         merged = _merge_company_meta(fa, vci)
         return merged, w_fa + w_vci
 
-    def get_company_shareholders(self, symbol: str) -> Tuple[List[CompanyShareholderModel], List[str]]:
+    def get_company_shareholders(self, symbol: str) -> tuple[list[CompanyShareholderModel], list[str]]:
         logger.info(f"Crawling Shareholders for {symbol}...")
         results = []
         warnings = []
@@ -605,7 +607,7 @@ class VnstockCrawlerService:
         except Exception as e:
             return [], [f"Exception: {str(e)}"]
 
-    def get_company_dividends(self, symbol: str) -> Tuple[List[CompanyDividendModel], List[str]]:
+    def get_company_dividends(self, symbol: str) -> tuple[list[CompanyDividendModel], list[str]]:
         logger.info(f"Crawling Dividends for {symbol}...")
         results = []
         warnings = []
