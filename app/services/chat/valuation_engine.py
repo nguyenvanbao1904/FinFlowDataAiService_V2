@@ -129,7 +129,9 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
         median_pe: float         — Trung vị PE lịch sử (optional, for cross-check)
         median_pb: float         — Trung vị PB lịch sử (optional, for cross-check)
         forecast_profit: float   — Lợi nhuận dự báo (tỷ đồng, optional)
-        cplh: float              — Cổ phiếu lưu hành (optional, for forward EPS)
+        forecast_revenue: float  — Doanh thu dự báo (tỷ đồng, optional)
+        forecast_series: list    — Chuỗi dự báo [{year, revenue_pred, profit_pred}]
+        cplh: float              — Cổ phiếu lưu hành (optional, for forward EPS/revenue)
     """
     try:
         eps = float(args.get("eps", 0))
@@ -141,7 +143,11 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
         industry_label = args.get("industry_label")
         median_pe = args.get("median_pe")
         median_pb = args.get("median_pb")
+        median_ps = args.get("median_ps")
+        live_ps = args.get("live_ps")
         forecast_profit = args.get("forecast_profit")
+        forecast_revenue = args.get("forecast_revenue")
+        forecast_series = args.get("forecast_series", [])
         cplh = args.get("cplh")
 
         # ── Resolve industry & playbook ──
@@ -153,8 +159,10 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
         default_g = params["default_growth"]
         margin_pct = params.get("margin_pct", 10)
 
-        # ── Compute CAGR from profit history ──
-        cagr = _compute_profit_cagr(profit_history)
+        # ── Compute growth: prefer forward forecast CAGR when the user asks for a future horizon.
+        historical_cagr = _compute_profit_cagr(profit_history)
+        forecast_cagr = _compute_forecast_profit_cagr(profit_history, forecast_series)
+        cagr = forecast_cagr if forecast_cagr is not None else historical_cagr
 
         # ── Guardrail: g must be well below CoE ──
         # Use a minimum spread of 3 percentage points (or 25% of CoE) to prevent
@@ -203,25 +211,38 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
         w_pb = weights.get("pb", 0.4)
         w_ps = weights.get("ps", 0.0)
 
-        # Since we can't compute P/S, redistribute its weight.
-        # If P/B has 0 weight in playbook (e.g., RETAIL), assign P/S weight
-        # to P/B as a valuation floor/anchor — never go 100% one method.
-        if w_ps > 0 and w_pb == 0:
-            w_pb = w_ps  # RETAIL: 60% P/E + 40% P/B (was 40% P/S)
-        elif w_ps > 0:
-            # Distribute P/S evenly between P/E and P/B.
-            w_pe += w_ps / 2
-            w_pb += w_ps / 2
+        # Compute P/S-based price using forward revenue when available.
+        price_ps = 0.0
+        can_use_ps = False
+        if w_ps > 0 and median_ps and median_ps > 0:
+            revenue_per_share = 0.0
+            if forecast_revenue is not None and cplh and cplh > 0:
+                revenue_per_share = float(forecast_revenue) * 1e9 / float(cplh)
+            elif live_ps and live_ps > 0:
+                revenue_per_share = live_price / float(live_ps)
+            if revenue_per_share > 0:
+                price_ps = revenue_per_share * float(median_ps)
+                can_use_ps = True
 
-        total_w = w_pe + w_pb
+        if w_ps > 0 and not can_use_ps:
+            if w_pb == 0:
+                w_pb = w_ps
+            else:
+                w_pe += w_ps / 2
+                w_pb += w_ps / 2
+            w_ps = 0.0
+
+        total_w = w_pe + w_pb + w_ps
         if total_w > 0:
             w_pe_norm = w_pe / total_w
             w_pb_norm = w_pb / total_w
+            w_ps_norm = w_ps / total_w
         else:
             w_pe_norm = 0.6
             w_pb_norm = 0.4
+            w_ps_norm = 0.0
 
-        price_composite = (price_pe * w_pe_norm) + (price_pb * w_pb_norm)
+        price_composite = (price_pe * w_pe_norm) + (price_pb * w_pb_norm) + (price_ps * w_ps_norm)
         price_composite = round(price_composite / 100) * 100  # Round to nearest 100
 
         # ── Comparison ──
@@ -241,16 +262,24 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "industry_key": industry_key,
             "method": playbook_entry["method"],
-            "weights_used": f"{w_pe_norm*100:.0f}% P/E + {w_pb_norm*100:.0f}% P/B",
+            "weights_used": (
+                f"{w_pe_norm*100:.0f}% P/E + {w_pb_norm*100:.0f}% P/B + {w_ps_norm*100:.0f}% P/S"
+                if w_ps_norm > 0
+                else f"{w_pe_norm*100:.0f}% P/E + {w_pb_norm*100:.0f}% P/B"
+            ),
             "coe_pct": coe * 100,
             "g_pct": round(g * 100, 2),
             "cagr_pct": round(cagr * 100, 2) if cagr is not None else None,
+            "historical_cagr_pct": round(historical_cagr * 100, 2) if historical_cagr is not None else None,
+            "forecast_cagr_pct": round(forecast_cagr * 100, 2) if forecast_cagr is not None else None,
+            "growth_source": "forecast" if forecast_cagr is not None else "historical",
             "pe_target": round(pe_target, 2),
             "pb_target": round(pb_target, 2),
             "eps_used": round(forward_eps, 2),
             "bvps_used": round(bvps, 2),
             "price_pe": round(price_pe / 100) * 100,
             "price_pb": round(price_pb / 100) * 100,
+            "price_ps": round(price_ps / 100) * 100,
             "price_composite": price_composite,
             "live_price": live_price,
             "upside_pct": round(upside_pct, 1),
@@ -261,12 +290,13 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
             "target_year": args.get("target_year", ""),
             "summary": (
                 f"Định giá năm {args.get('target_year', '?')}. "
-                f"Ngành {industry_key}, phương pháp {w_pe_norm*100:.0f}% P/E + {w_pb_norm*100:.0f}% P/B. "
-                f"CAGR lợi nhuận {'N/A' if cagr is None else f'{cagr*100:.1f}%'}, "
+                f"Ngành {industry_key}, phương pháp {'%d%% P/E + %d%% P/B + %d%% P/S' % (w_pe_norm*100, w_pb_norm*100, w_ps_norm*100) if w_ps_norm > 0 else '%d%% P/E + %d%% P/B' % (w_pe_norm*100, w_pb_norm*100)}. "
+                f"CAGR lợi nhuận ({'dự phóng' if forecast_cagr is not None else 'lịch sử'}) {'N/A' if cagr is None else f'{cagr*100:.1f}%'}, "
                 f"tốc độ tăng trưởng bền vững g={g*100:.1f}% (CoE={coe*100:.0f}%). "
                 f"P/E target {pe_target:.1f}x, P/B target {pb_target:.1f}x. "
                 f"Giá theo P/E: {round(price_pe/100)*100:,.0f}đ, "
                 f"giá theo P/B: {round(price_pb/100)*100:,.0f}đ, "
+                f"giá theo P/S: {round(price_ps/100)*100:,.0f}đ, "
                 f"giá tổng hợp: {price_composite:,.0f}đ. "
                 f"Giá hiện tại: {live_price:,.0f}đ → {verdict} ({upside_pct:+.1f}%)."
             ),
@@ -274,6 +304,64 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("compute_fair_value error: %s", exc)
         return {"error": f"Lỗi tính toán: {str(exc)}"}
+
+
+def _compute_forecast_profit_cagr(
+    profit_history: list[Any],
+    forecast_series: list[Any],
+) -> float | None:
+    """Compute CAGR from latest actual profit to target-year forecast profit."""
+    if not forecast_series or not isinstance(forecast_series, list):
+        return None
+
+    actual_entries: list[tuple[int, float]] = []
+    for item in profit_history or []:
+        if not isinstance(item, dict):
+            continue
+        year = item.get("year")
+        profit = item.get("profit_after_tax") or item.get("profitAfterTax")
+        if year is None or profit is None:
+            continue
+        try:
+            parsed = (int(year), float(profit))
+        except (ValueError, TypeError):
+            continue
+        if parsed[1] > 0:
+            actual_entries.append(parsed)
+
+    forecast_entries: list[tuple[int, float]] = []
+    for item in forecast_series:
+        if not isinstance(item, dict):
+            continue
+        year = item.get("year") or item.get("predict_target_year")
+        profit = item.get("profit_pred")
+        if year is None or profit is None:
+            continue
+        try:
+            parsed = (int(year), float(profit))
+        except (ValueError, TypeError):
+            continue
+        if parsed[1] > 0:
+            forecast_entries.append(parsed)
+
+    if not actual_entries or not forecast_entries:
+        return None
+
+    base_year, base_profit = max(actual_entries, key=lambda x: x[0])
+    target_year, target_profit = max(forecast_entries, key=lambda x: x[0])
+    n_years = target_year - base_year
+    if n_years <= 0:
+        return None
+
+    try:
+        cagr = (target_profit / base_profit) ** (1.0 / n_years) - 1.0
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+    if not (-0.5 <= cagr <= 1.0):
+        return None
+
+    return cagr
 
 
 def _compute_profit_cagr(profit_history: list[Any]) -> float | None:

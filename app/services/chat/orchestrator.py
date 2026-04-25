@@ -513,8 +513,12 @@ class ChatOrchestrator:
         five_years_ago = today.replace(year=today.year - 5)
         yr = target_year or today.year
 
-        # Fetch 5 data sources in parallel.
-        metrics_r, financial_r, daily_val_r, live_r, forecast_r = (
+        forecast_years = [yr]
+        if yr > today.year + 1:
+            forecast_years = list(range(today.year + 1, yr + 1))
+
+        # Fetch market data and forecast horizon in parallel.
+        metrics_r, financial_r, daily_val_r, live_r, *forecast_results = (
             await asyncio.gather(
                 self._tool_client.execute_tool_call(
                     "get_company_metrics", {"symbol": symbol},
@@ -534,10 +538,13 @@ class ChatOrchestrator:
                 self._tool_client.execute_tool_call(
                     "get_company_live_valuation_snapshot", {"symbol": symbol},
                 ),
-                self._tool_client.execute_tool_call(
-                    "get_company_forecast",
-                    {"symbol": symbol, "targetYear": yr},
-                ),
+                *[
+                    self._tool_client.execute_tool_call(
+                        "get_company_forecast",
+                        {"symbol": symbol, "targetYear": forecast_year},
+                    )
+                    for forecast_year in forecast_years
+                ],
             )
         )
 
@@ -568,6 +575,7 @@ class ChatOrchestrator:
             }
             for item in raw_entries
             if isinstance(item, dict) and "year" in item
+            and (item.get("quarter") is None or item.get("quarter") == 0)
         ]
 
         # Daily valuations summary.
@@ -578,8 +586,24 @@ class ChatOrchestrator:
         # Live price.
         live_data = live_r.get("data") or {}
 
-        # Forecast (non-critical — may not have forecast for future year).
-        forecast_data = forecast_r.get("data") or {}
+        # Forecasts are non-critical; use the horizon when available for forward valuation.
+        forecast_series = []
+        for result in forecast_results:
+            data = result.get("data") if result.get("ok") else None
+            if isinstance(data, dict):
+                forecast_series.append({
+                    "year": data.get("predict_target_year"),
+                    "revenue_pred": data.get("revenue_pred"),
+                    "profit_pred": data.get("profit_pred"),
+                    "feature_year": data.get("feature_year"),
+                })
+        forecast_data = next(
+            (
+                item for item in forecast_series
+                if item.get("year") == yr
+            ),
+            forecast_series[-1] if forecast_series else {},
+        )
 
         return {
             "eps": overview.get("eps", 0),
@@ -591,7 +615,11 @@ class ChatOrchestrator:
             "industry_label": overview.get("industryLabel"),
             "median_pe": daily_summary.get("pe_median"),
             "median_pb": daily_summary.get("pb_median"),
+            "median_ps": daily_summary.get("ps_median"),
+            "live_ps": live_data.get("livePs"),
             "forecast_profit": forecast_data.get("profit_pred"),
+            "forecast_revenue": forecast_data.get("revenue_pred"),
+            "forecast_series": forecast_series,
             "cplh": overview.get("cplh", 0),
             "symbol": symbol,
             "target_year": yr,

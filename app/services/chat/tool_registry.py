@@ -53,9 +53,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     ),
     _tool(
         "get_company_daily_valuations",
-        "Bảng tóm tắt PE/PB/PS hàng ngày (trung vị, trung bình, min, max) từ DB 5-10 năm. "
+        "Bảng tóm tắt PE/PB/PS hàng ngày (trung vị, trung bình, min, max). "
         "ĐÂY LÀ NGUỒN CHÍNH cho so sánh định giá lịch sử. Mặc định dùng 5 năm. "
-        "Backend tự tính toán thống kê, trả về summary gọn.",
+        "Dữ liệu thực tế có thể 3-5 năm tùy mã. Backend tự tính toán thống kê, trả về summary gọn.",
         {
             "symbol": {"type": "string", "description": "Mã cổ phiếu"},
             "startDate": {"type": "string", "minLength": 8, "description": "Ngày bắt đầu YYYY-MM-DD"},
@@ -104,14 +104,25 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     ),
     _tool(
         "get_company_valuations",
-        "PE/PB/PS theo quý từ DB. Chỉ có dữ liệu ~2 năm gần đây. "
-        "Ưu tiên dùng get_company_daily_valuations thay thế.",
+        "PE/PB/PS theo quý từ DB (có thể tới 20+ năm từ FireAnt). "
+        "Ưu tiên dùng get_company_daily_valuations nếu cần thống kê trung vị/trung bình.",
         {
             "symbol": {"type": "string", "description": "Mã cổ phiếu"},
             "annualLimit": {"type": "integer", "minimum": 1},
             "startDate": {"type": "string"},
             "endDate": {"type": "string"},
             "showQuarterly": {"type": "boolean"},
+        },
+        required=["symbol"],
+    ),
+    _tool(
+        "get_company_cash_flows",
+        "Dòng tiền hoạt động, đầu tư, tài chính theo năm/quý. Dùng khi hỏi về chất lượng lợi nhuận, "
+        "CFO/FCF, lợi nhuận có chuyển thành tiền hay không, dòng tiền âm/dương, hoặc rủi ro dòng tiền.",
+        {
+            "symbol": {"type": "string", "description": "Mã cổ phiếu"},
+            "annualLimit": {"type": "integer", "minimum": 1, "description": "Số năm gần nhất"},
+            "quarterlyLimit": {"type": "integer", "minimum": 1, "description": "Số quý gần nhất"},
         },
         required=["symbol"],
     ),

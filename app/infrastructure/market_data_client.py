@@ -105,6 +105,9 @@ class MarketDataToolClient:
             if name == "get_company_daily_valuations":
                 payload = self._summarize_daily_valuations(payload)
 
+            if name == "get_company_cash_flows":
+                payload = self._extract_cash_flows(payload)
+
             result = {
                 "name": name,
                 "ok": True,
@@ -178,6 +181,15 @@ class MarketDataToolClient:
             # Default to annualLimit=3 and quarterlyLimit=0 to prevent pulling data back to 2013 if forgot.
             if "annualLimit" not in params:
                 params["annualLimit"] = 3
+            if "quarterlyLimit" not in params:
+                params["quarterlyLimit"] = 0
+            return "GET", f"/investment/query/companies/{symbol}/analysis/financials", params
+
+        if name == "get_company_cash_flows":
+            symbol = self._required_str(arguments, "symbol")
+            params = self._optional_common_series_params(arguments)
+            if "annualLimit" not in params:
+                params["annualLimit"] = 5
             if "quarterlyLimit" not in params:
                 params["quarterlyLimit"] = 0
             return "GET", f"/investment/query/companies/{symbol}/analysis/financials", params
@@ -301,6 +313,15 @@ class MarketDataToolClient:
         if not isinstance(payload, dict):
             return payload
         return {"overview": payload.get("overview")}
+
+    @staticmethod
+    def _extract_cash_flows(payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"cashFlows": []}
+        cash_flows = payload.get("cashFlows")
+        if cash_flows is None and isinstance(payload.get("financialSeries"), dict):
+            cash_flows = payload["financialSeries"].get("cashFlows")
+        return {"cashFlows": cash_flows if isinstance(cash_flows, list) else []}
 
     @staticmethod
     def _summarize_daily_valuations(payload: list[dict[str, Any]]) -> dict[str, Any]:
