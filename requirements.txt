@@ -55,9 +55,6 @@ typer==0.24.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.6.3
-vnai==2.4.0
-vnstock==3.5.0
-vnstock_ezchart==0.0.3
 wcwidth==0.6.0
 wordcloud==1.9.6
 zipp==3.23.0

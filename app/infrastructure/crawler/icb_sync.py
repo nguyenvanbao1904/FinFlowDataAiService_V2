@@ -1,14 +1,7 @@
 """
 Xây payload đồng bộ cây ngành ICB → Java ``POST .../industry-nodes``.
 
-Quan trọng về FireAnt:
-- ``GET /symbols/{symbol}/profile`` trả ``icbCode`` dạng **4-digit** (vd: ``8355``).
-- ``GET /icb`` trả danh sách ngành dạng **8-digit** (không khớp trực tiếp ``icbCode``).
-- ``GET /industries`` trả danh sách ngành dạng **4-digit** với ``level`` (khớp trực tiếp ``icbCode``).
-
-Vì vậy:
-- Nếu có token FireAnt: sync bằng ``GET /industries`` (không fallback).
-- Nếu không có token: fallback sang vnstock VCI ``Listing.industries_icb()``.
+Source: FireAnt ``GET /industries`` (4-digit codes, matches ``profile.icbCode``).
 
 Suy luận cha (khi mã là 4-digit):
 - level 2: ABCD -> A000
@@ -101,26 +94,6 @@ def fetch_icb_rows_from_fireant() -> list[tuple[str, int, str]]:
     return out
 
 
-def fetch_icb_rows_from_vci() -> list[tuple[str, int, str]]:
-    from vnstock import Listing
-
-    listing = Listing(source="VCI")
-    df = listing.industries_icb(show_log=False)
-    if df is None or len(df) == 0:
-        return []
-    out: list[tuple[str, int, str]] = []
-    for _, row in df.iterrows():
-        code = str(row.get("icb_code", "")).strip()
-        name = str(row.get("icb_name", "")).strip()
-        try:
-            lv = int(row.get("level", 0))
-        except (TypeError, ValueError):
-            continue
-        if code and name:
-            out.append((code, lv, name))
-    return out
-
-
 def _longest_prefix_parent(
     child_code: str, child_level: int, nodes: list[dict[str, Any]]
 ) -> str | None:
@@ -155,21 +128,9 @@ def _infer_parent_code_by_level(code: str, level: int) -> str | None:
 
 
 def build_industry_node_payloads() -> list[dict[str, Any]]:
-    token = settings.FIREANT_ACCESS_TOKEN.strip()
-    if token:
-        rows = fetch_icb_rows_from_fireant()
-        source = "fireant"
-        if not rows:
-            logger.error(
-                "FireAnt GET /industries trả rỗng hoặc lỗi trong khi đã có FIREANT_ACCESS_TOKEN — "
-                "bỏ sync industry-nodes (không fallback VCI để đồng nhất với profile FireAnt)."
-            )
-            return []
-    else:
-        rows = fetch_icb_rows_from_vci()
-        source = "vci"
+    rows = fetch_icb_rows_from_fireant()
     if not rows:
-        logger.warning("No ICB rows from VCI/FireAnt — skip industry-nodes sync")
+        logger.error("FireAnt GET /industries returned empty — skip industry-nodes sync")
         return []
 
     # dedupe by code (keep first)
@@ -205,5 +166,5 @@ def build_industry_node_payloads() -> list[dict[str, Any]]:
             }
         )
 
-    logger.info("Built %d industry-nodes from %s", len(payloads), source)
+    logger.info("Built %d industry-nodes from FireAnt", len(payloads))
     return payloads

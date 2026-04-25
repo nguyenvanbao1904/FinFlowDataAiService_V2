@@ -2,24 +2,23 @@ import logging
 import json
 import time
 import os
-import re
 import asyncio
+from pathlib import Path
 
-# --- INJECT API KEY EARLY ---
 from dotenv import load_dotenv
 
 load_dotenv()
-_vnstock_key = os.getenv("VNSTOCK_API_KEY")
-if _vnstock_key:
-    os.environ["VNSTOCK_API_KEY"] = _vnstock_key
 
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Manager, Lock
+from multiprocessing import Lock
+from app.core.config import settings
 from app.models.investment import CompanyModel
 from app.infrastructure.crawler.icb_sync import build_industry_node_payloads
-from app.infrastructure.crawler.vnstock_adapter import VnstockCrawlerService
+from app.infrastructure.crawler.fireant_crawler_service import FireAntCrawlerService
+from app.infrastructure.crawler.fireant_financial_client import fetch_all_symbols
 from app.infrastructure.backend_client import JavaBackendClient
+import app.core.http_client as _http_mod
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,31 +28,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 log_lock = Lock()
 
-STATE_FILE = "crawler_state.json"
+STATE_DIR = Path(settings.CRAWLER_STATE_DIR)
+STATE_FILE = STATE_DIR / "crawler_state.json"
+FAILED_REPORT_FILE = STATE_DIR / "failed_report.json"
 MAX_WORKERS = 8
 RETRY_MAX = 3
-RATE_LIMIT_DEFAULT = 15
-SAFE_DELAY = 1
+SAFE_DELAY = 0.5
 
 
 def load_state():
-    """Tải trạng thái crawl để skip các mã đã thành công."""
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+    if STATE_FILE.exists():
+        with STATE_FILE.open("r", encoding="utf-8") as f:
             return json.load(f)
     return {"successful": []}
 
 
 def save_state(state):
     with log_lock:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with STATE_FILE.open("w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=4)
 
 
-def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
-    """Tiến trình crawl cho 1 mã chứng khoán."""
+def run_crawler_for_symbol(sym_data: tuple):
+    """Crawl + push financial data for a single symbol."""
     symbol, is_bank, exchange_group = sym_data
-    crawler = VnstockCrawlerService()
+    crawler = FireAntCrawlerService()
     errors = []
 
     debug_symbols_env = os.getenv("DEBUG_COMPANY_META_SYMBOLS", "")
@@ -63,54 +63,17 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
         else set()
     )
 
-    # --- SAFE REQUEST WRAPPER ---
     def safe_request(func, *args):
         retries = 0
         while retries < RETRY_MAX:
-            with api_lock:
-                current_time = time.time()
-                time_to_wait = max(0, manager_dict["rate_limit_wait_until"] - current_time)
-                if time_to_wait > 0:
-                    logger.info(
-                        f"[{symbol}] Đang chờ {time_to_wait:.0f}s do Rate Limit từ tiến trình khác..."
-                    )
-                    time.sleep(time_to_wait)
-                manager_dict["rate_limit_wait_until"] = time.time() + SAFE_DELAY
-
             try:
-                res, warnings = func(*args)
-
-                # VCI sometimes returns empty on rate limit
-                for w in warnings:
-                    if "tối đa" in w.lower() or "limit" in w.lower():
-                        raise Exception("Rate limit exceeded")
-                return res, warnings
-
+                time.sleep(SAFE_DELAY)
+                return func(*args)
             except Exception as e:
-                err_msg = str(e)
-                # Catch generic rate limit texts from vnstock's stack traces or prints
-                if (
-                    "tối đa" in err_msg.lower()
-                    or "limit" in err_msg.lower()
-                    or "thử lại" in err_msg.lower()
-                    or "Too Many Requests" in err_msg
-                ):
-                    match = re.search(r"thử lại sau (\d+) giây", err_msg)
-                    wait_time = int(match.group(1)) if match else RATE_LIMIT_DEFAULT
-                    retries += 1
-                    with api_lock:
-                        new_wait = time.time() + wait_time + 5
-                        if new_wait > manager_dict["rate_limit_wait_until"]:
-                            manager_dict["rate_limit_wait_until"] = new_wait
-                            logger.warning(
-                                "RATE LIMIT DETECTED for %s! Waiting %ds before retry %d/%d",
-                                symbol, wait_time + 5, retries, RETRY_MAX,
-                            )
-                else:
-                    retries += 1
-                    time.sleep(2**retries)
-                    logger.info(f"[{symbol}] Lỗi: {err_msg}. Thử lại lần {retries}/{RETRY_MAX}...")
-
+                retries += 1
+                wait = 2 ** retries
+                logger.warning("[%s] Error: %s. Retry %d/%d in %ds", symbol, e, retries, RETRY_MAX, wait)
+                time.sleep(wait)
         return [], [f"Failed after {RETRY_MAX} retries"]
 
     # 1. Indicators
@@ -128,21 +91,24 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
     if not balances:
         errors.append(f"Balance failed: {w_bal}")
 
-    # 4. Shareholders
+    # 4. Cash Flow (optional — many small companies have none)
+    cashflows, w_cf = safe_request(crawler.get_cash_flow_statements, symbol)
+
+    # 5. Shareholders
     shareholders, w_sh = safe_request(crawler.get_company_shareholders, symbol)
     if not shareholders and w_sh:
         errors.append(f"Shareholders failed: {w_sh}")
 
-    # 5. Dividends
+    # 6. Dividends
     dividends, w_div = safe_request(crawler.get_company_dividends, symbol)
     if not dividends and w_div:
         errors.append(f"Dividends failed: {w_div}")
 
-    # Company meta (tên, mô tả, ICB → resolve industry_node_id trên backend)
+    # 7. Company meta
     company_meta, w_meta = safe_request(crawler.get_company_overview_meta, symbol)
 
     if symbol.upper() in debug_symbols:
-        logger.info(f"[{symbol}] company_meta={company_meta} warnings={w_meta}")
+        logger.info("[%s] company_meta=%s warnings=%s", symbol, company_meta, w_meta)
 
     # --- MAP TO DTOs AND PUSH TO JAVA BACKEND ---
     client = JavaBackendClient()
@@ -151,15 +117,10 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
         def f(v):
             return float(v) if v is not None else None
 
-        balance_sheets = []
-        income_stmts = []
-        financial_inds = []
-
         icb_code = (company_meta.get("icbCode") or "").strip() if company_meta else ""
         company_name = company_meta.get("companyName") if company_meta else None
         description = company_meta.get("description") if company_meta else None
 
-        # Luôn đẩy company (tên/mô tả/icb) trước — không phụ thuộc chỉ báo tài chính (để gán industry_node_id).
         if company_name is not None or description is not None or icb_code:
             companies_payload = [
                 CompanyModel(
@@ -176,146 +137,46 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
         if errors:
             return
 
-        # Process Financial Indicators (separate logic for BANK vs NON-BANK)
+        # Financial Indicators — model_dump gives camelCase keys matching Java DTOs
         if inds:
+            financial_inds = []
             for ind in inds:
-                base_dto = {
-                    "companyId": symbol,
-                    "year": ind.year if hasattr(ind, "year") else 2026,
-                    "quarter": ind.quarter if hasattr(ind, "quarter") else 1,
-                    "pe": f(getattr(ind, "pe", None)),
-                    "pb": f(getattr(ind, "pb", None)),
-                    "ps": f(getattr(ind, "ps", None)),
-                    "roe": f(getattr(ind, "roe", None)),
-                    "roa": f(getattr(ind, "roa", None)),
-                    "eps": f(getattr(ind, "eps", None)),
-                    "bvps": f(getattr(ind, "bvps", None)),
-                    "cplh": f(getattr(ind, "cplh", None)),
-                }
-
-                # Add bank or non-bank specific fields
+                dto = ind.model_dump()
                 if is_bank:
-                    # Bank only: NO lng, lnr
-                    financial_inds.append(base_dto)
+                    dto.pop("grossMargin", None)
+                    dto.pop("netMargin", None)
                 else:
-                    # Non-bank: add lng, lnr
-                    base_dto["lng"] = f(getattr(ind, "lng", None))
-                    base_dto["lnr"] = f(getattr(ind, "lnr", None))
-                    financial_inds.append(base_dto)
+                    dto.pop("grossMargin", None)
+                    dto.pop("netMargin", None)
+                financial_inds.append(dto)
 
-        # Process Income Statements
+            endpoint = "bank-financial-indicators" if is_bank else "non-bank-financial-indicators"
+            await client.push_data(endpoint, financial_inds)
+
+        # Income Statements
         if incomes:
+            income_stmts = []
             for inc in incomes:
+                dto = inc.model_dump()
                 if is_bank:
-                    # Map only fields that exist in Java DTO to avoid unknown-property issues
-                    dto = {
-                        "companyId": symbol,
-                        "year": inc.year if hasattr(inc, "year") else 2026,
-                        "quarter": inc.quarter if hasattr(inc, "quarter") else 1,
-                        "profitAfterTax": f(getattr(inc, "profitAfterTax", None)),
-                        "netInterestIncome": f(getattr(inc, "netInterestIncome", None)),
-                        "netFeeAndCommissionIncome": f(
-                            getattr(inc, "netFeeAndCommissionIncome", None)
-                        ),
-                        "netOtherIncomeOrExpenses": f(
-                            getattr(inc, "netOtherIncomeOrExpenses", None)
-                        ),
-                        # pydantic field is "interestAndSimilarExpenses"; DTO expects "interestExpense"
-                        "interestExpense": f(getattr(inc, "interestAndSimilarExpenses", None)),
-                        "netProfit": f(getattr(inc, "netProfit", None)),
-                    }
-                else:
-                    dto = {
-                        "companyId": symbol,
-                        "year": inc.year if hasattr(inc, "year") else 2026,
-                        "quarter": inc.quarter if hasattr(inc, "quarter") else 1,
-                        "profitAfterTax": f(getattr(inc, "profitAfterTax", None)),
-                        "netRevenue": f(getattr(inc, "netRevenue", None)),
-                        "totalRevenue": f(getattr(inc, "totalRevenue", None)),
-                        "netProfit": f(getattr(inc, "netProfit", None)),
-                    }
+                    dto["interestExpense"] = dto.pop("interestAndSimilarExpenses", None)
                 income_stmts.append(dto)
 
-        # Process Balance Sheets
-        if balances:
-            for bal in balances:
-                if is_bank:
-                    dto = {
-                        "companyId": symbol,
-                        "year": bal.year if hasattr(bal, "year") else 2026,
-                        "quarter": bal.quarter if hasattr(bal, "quarter") else 1,
-                        "cashAndCashEquivalents": f(
-                            getattr(bal, "cashAndCashEquivalents", None)
-                        ),
-                        "totalAssets": f(getattr(bal, "totalAssets", None)),
-                        "equity": f(getattr(bal, "equity", None)),
-                        "totalCapital": f(getattr(bal, "totalCapital", None)),
-                        "totalLiabilities": f(getattr(bal, "totalLiabilities", None)),
-                        "balancesWithSbv": f(getattr(bal, "balancesWithSbv", None)),
-                        "interbankPlacementsAndLoans": f(
-                            getattr(bal, "interbankPlacementsAndLoans", None)
-                        ),
-                        "tradingSecurities": f(getattr(bal, "tradingSecurities", None)),
-                        "investmentSecurities": f(
-                            getattr(bal, "investmentSecurities", None)
-                        ),
-                        "loansToCustomers": f(getattr(bal, "loansToCustomers", None)),
-                        "govAndSbvDebt": f(getattr(bal, "govAndSbvDebt", None)),
-                        "depositsBorrowingsOthers": f(
-                            getattr(bal, "depositsBorrowingsOthers", None)
-                        ),
-                        "depositsFromCustomers": f(
-                            getattr(bal, "depositsFromCustomers", None)
-                        ),
-                        "convertibleAndOtherPapers": f(
-                            getattr(bal, "convertibleAndOtherPapers", None)
-                        ),
-                    }
-                else:
-                    dto = {
-                        "companyId": symbol,
-                        "year": bal.year if hasattr(bal, "year") else 2026,
-                        "quarter": bal.quarter if hasattr(bal, "quarter") else 1,
-                        "cashAndCashEquivalents": f(
-                            getattr(bal, "cashAndCashEquivalents", None)
-                        ),
-                        "totalAssets": f(getattr(bal, "totalAssets", None)),
-                        "equity": f(getattr(bal, "equity", None)),
-                        "totalCapital": f(getattr(bal, "totalCapital", None)),
-                        "totalLiabilities": f(getattr(bal, "totalLiabilities", None)),
-                        "shortTermInvestments": f(
-                            getattr(bal, "shortTermInvestments", None)
-                        ),
-                        "shortTermReceivables": f(
-                            getattr(bal, "shortTermReceivables", None)
-                        ),
-                        "longTermReceivables": f(getattr(bal, "longTermReceivables", None)),
-                        "inventories": f(getattr(bal, "inventories", None)),
-                        "fixedAssets": f(getattr(bal, "fixedAssets", None)),
-                        "shortTermBorrowings": f(getattr(bal, "shortTermBorrowings", None)),
-                        "longTermBorrowings": f(getattr(bal, "longTermBorrowings", None)),
-                        "advancesFromCustomers": f(
-                            getattr(bal, "advancesFromCustomers", None)
-                        ),
-                    }
-                balance_sheets.append(dto)
-
-        # Push to backend
-        if balance_sheets:
-            endpoint = "bank-balance-sheets" if is_bank else "non-bank-balance-sheets"
-            await client.push_data(endpoint, balance_sheets)
-
-        if income_stmts:
             endpoint = "bank-income-statements" if is_bank else "non-bank-income-statements"
             await client.push_data(endpoint, income_stmts)
 
-        if financial_inds:
-            endpoint = (
-                "bank-financial-indicators" if is_bank else "non-bank-financial-indicators"
-            )
-            await client.push_data(endpoint, financial_inds)
+        # Balance Sheets
+        if balances:
+            balance_sheets = [bal.model_dump() for bal in balances]
+            endpoint = "bank-balance-sheets" if is_bank else "non-bank-balance-sheets"
+            await client.push_data(endpoint, balance_sheets)
 
-        # Push shareholders + dividends (previously crawled but not persisted).
+        # Cash Flow Statements
+        if cashflows:
+            cf_payload = [cf.model_dump() for cf in cashflows]
+            await client.push_data("cash-flow-statements", cf_payload)
+
+        # Shareholders
         if shareholders:
             shareholders_payload = [
                 s.model_dump()
@@ -325,112 +186,45 @@ def run_crawler_for_symbol(sym_data: tuple, manager_dict, api_lock):
             if shareholders_payload:
                 await client.push_data(f"shareholders/{symbol}", shareholders_payload)
 
+        # Dividends
         if dividends:
             dividends_payload = [d.model_dump() for d in dividends]
             if dividends_payload:
                 await client.push_data(f"dividends/{symbol}", dividends_payload)
 
     try:
+        _http_mod._client = None
         asyncio.run(push_all())
     except Exception as push_err:
         errors.append(f"Push to DB failed: {str(push_err)}")
 
     if not errors:
-        logger.info(f"✅ {symbol} CRAWL AND SYNC SUCCESS")
+        logger.info("✅ %s CRAWL AND SYNC SUCCESS", symbol)
         return symbol, True, None
     else:
-        logger.info(f"❌ {symbol} FAILED: {errors}")
+        logger.info("❌ %s FAILED: %s", symbol, errors)
         return symbol, False, errors
 
 
-from vnstock import Listing
+def get_market_symbols() -> list[tuple[str, bool, str]]:
+    """Fetch ALL symbols from FireAnt, auto-detect bank vs non-bank."""
+    logger.info("Fetching symbol list from FireAnt...")
 
+    debug_env = os.getenv("DEBUG_SYMBOLS", "")
+    if debug_env:
+        forced = [s.strip().upper() for s in debug_env.split(",") if s.strip()]
+        logger.info("DEBUG_SYMBOLS override: %s", forced)
+        crawler = FireAntCrawlerService()
+        result = []
+        for sym in forced:
+            ct = crawler.detect_company_type(sym)
+            is_bank = ct == "Bank" if ct else False
+            result.append((sym, is_bank, "HOSE"))
+        return result
 
-def get_market_symbols() -> list[tuple[str, bool]]:
-    """
-    Fetch ALL symbols dynamically from HOSE, HNX, and UPCOM.
-    """
-    # 1. Danh sách tất cả các ngân hàng niêm yết tại VN (đã public, hiếm khi thêm mới)
-    # Đây là cách hiệu quả nhất thay vì gọi API overview() 1600 lần chỉ để check "is_bank"
-    bank_symbols = {
-        "VCB",
-        "BID",
-        "CTG",
-        "MBB",
-        "TCB",
-        "VPB",
-        "ACB",
-        "SSB",
-        "SHB",
-        "HDB",
-        "TPB",
-        "VIB",
-        "MSB",
-        "LPB",
-        "EIB",
-        "OCB",
-        "SEB",
-        "BAB",
-        "KLB",
-        "NVB",
-        "VAB",
-        "BVB",
-        "SGB",
-        "NAB",
-        "PGB",
-        "ABB",
-        "TIN",
-    }
-
-    logger.info("Đang tải danh sách 1600+ mã chứng khoán từ HOSE, HNX, UPCOM...")
-    try:
-        listing = Listing(source="VCI")
-
-        # Lấy danh sách mã chứng khoán theo từng sàn
-        df_hose = listing.symbols_by_group("HOSE")
-        df_hnx = listing.symbols_by_group("HNX")
-        df_upcom = listing.symbols_by_group("UPCOM")
-
-        # Lấy cột symbol (tuỳ phiên bản vnstock mà có thể trả về DataFrame hoặc Series)
-        def extract_symbols(df):
-            if df is None or len(df) == 0:
-                return []
-
-            # Nếu là Series
-            if hasattr(df, "tolist"):
-                if not hasattr(df, "columns"):
-                    return df.tolist()
-
-            # Nếu là DataFrame
-            col = (
-                "ticker"
-                if "ticker" in df.columns
-                else "symbol" if "symbol" in df.columns else df.columns[0]
-            )
-            return df[col].astype(str).tolist()
-
-        all_tickers = []
-        for df, exc in [(df_hose, "HOSE"), (df_hnx, "HNX"), (df_upcom, "UPCOM")]:
-            syms = extract_symbols(df)
-            for s in syms:
-                if 2 <= len(s.strip()) <= 4:
-                    all_tickers.append((s.strip().upper(), exc))
-
-        # Loại bỏ trùng lặp (nếu có, thường không bị trùng qua các sàn)
-        unique_tickers = {}
-        for s, exc in all_tickers:
-            unique_tickers[s] = exc
-
-        final_list = list(unique_tickers.items())
-        logger.info(f"✅ Tải thành công {len(final_list)} mã chứng khoán!")
-
-        # Map thành tuple (symbol, is_bank, exchange)
-        return [(t, t in bank_symbols, exc) for t, exc in final_list]
-
-    except Exception as e:
-        logger.info(f"❌ Lỗi khi lấy danh sách mã toàn thị trường: {e}")
-        logger.info("⚠️ Đang fallback về danh sách mặc định (VN30)...")
-        # Fallback list just in case standard API fails
+    raw = fetch_all_symbols()
+    if not raw:
+        logger.error("FireAnt GET /symbols returned empty — using fallback")
         return [
             ("FPT", False, "HOSE"),
             ("HPG", False, "HOSE"),
@@ -440,76 +234,88 @@ def get_market_symbols() -> list[tuple[str, bool]]:
             ("MBB", True, "HOSE"),
         ]
 
+    results = []
+    for item in raw:
+        sym = (item.get("symbol") or item.get("ticker") or "").strip().upper()
+        if not sym or len(sym) < 2 or len(sym) > 4:
+            continue
+
+        exchange = (item.get("exchange") or item.get("floor") or "HOSE").strip().upper()
+        icb = (item.get("icbCode") or "").strip()
+        is_bank = icb.startswith("3010")
+        results.append((sym, is_bank, exchange))
+
+    logger.info("✅ Loaded %d symbols from FireAnt", len(results))
+    return results
+
 
 def run_batch_crawl():
     symbols_to_crawl = get_market_symbols()
 
-    # --- BATCH SYNC ALL COMPANIES UPFRONT ---
     client = JavaBackendClient()
 
-    # Cây ngành (ICB) — chạy một lần trước khi gán FK công ty
-    try:
-        tree = build_industry_node_payloads()
-        if tree:
-            asyncio.run(client.push_data("industry-nodes", tree))
-            logger.info(f"✅ Đã đồng bộ {len(tree)} nút industry-nodes.")
-    except Exception as e:
-        logger.info(f"⚠️ Không đồng bộ được industry-nodes (tiếp tục crawl): {e}")
+    async def push_master_data():
+        # ICB tree first
+        try:
+            tree = build_industry_node_payloads()
+            if tree:
+                await client.push_data("industry-nodes", tree)
+                logger.info("✅ Synced %d industry nodes.", len(tree))
+        except Exception as e:
+            logger.info("⚠️ Failed to sync industry-nodes (continuing): %s", e)
 
-    companies_payload = [
-        CompanyModel(id=sym, exchange=exc, companyType="BANK" if is_bank else "NON_BANK").model_dump()
-        for sym, is_bank, exc in symbols_to_crawl
-    ]
-    logger.info(
-        f"Đẩy toàn bộ {len(companies_payload)} mã Công ty (Master Data) lên Backend trước để tránh rác FK..."
-    )
+        # Push all companies master data upfront
+        companies_payload = [
+            CompanyModel(id=sym, exchange=exc, companyType="BANK" if is_bank else "NON_BANK").model_dump()
+            for sym, is_bank, exc in symbols_to_crawl
+        ]
+        logger.info("Pushing %d companies (Master Data) to Backend...", len(companies_payload))
+        await client.push_data("companies", companies_payload)
+        logger.info("✅ Master Data push success!")
+
     try:
-        asyncio.run(client.push_data("companies", companies_payload))
-        logger.info("✅ Đẩy Master Data Company thành công!")
+        _http_mod._client = None
+        asyncio.run(push_master_data())
     except Exception as e:
-        logger.info(f"❌ Lỗi khi đẩy Master Data Company. Dừng Crawler: {e}")
+        logger.info("❌ Failed to push Master Data. Stopping: %s", e)
         return
 
     state = load_state()
     successful_list = state.get("successful", [])
 
-    # Lọc bỏ các mã đã crawl thành công
     pending_symbols = [s for s in symbols_to_crawl if s[0] not in successful_list]
     logger.info(
-        f"Tổng số mã: {len(symbols_to_crawl)}. Đã xong: {len(successful_list)}. Còn lại: {len(pending_symbols)}"
+        "Total: %d. Done: %d. Pending: %d",
+        len(symbols_to_crawl), len(successful_list), len(pending_symbols),
     )
 
     if not pending_symbols:
-        logger.info("🎉 Tất cả các mã đã được crawl thành công!")
+        logger.info("🎉 All symbols already crawled!")
         return
 
     failed_report = {}
 
-    with Manager() as manager:
-        manager_dict = manager.dict()
-        manager_dict["rate_limit_wait_until"] = 0.0
-        api_lock = manager.Lock()
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_symbol = {
+            executor.submit(run_crawler_for_symbol, sym_data): sym_data[0]
+            for sym_data in pending_symbols
+        }
 
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_symbol = {
-                executor.submit(run_crawler_for_symbol, sym_data, manager_dict, api_lock): sym_data[0]
-                for sym_data in pending_symbols
-            }
-
-            for future in as_completed(future_to_symbol):
-                try:
-                    sym, success, errors = future.result()
-                    if success:
-                        state["successful"].append(sym)
-                        save_state(state)
-                    else:
-                        failed_report[sym] = errors
-                except Exception as exc:
-                    logger.info(f"Tiến trình crash cho một mã: {exc}")
+        for future in as_completed(future_to_symbol):
+            try:
+                sym, success, errors = future.result()
+                if success:
+                    state["successful"].append(sym)
+                    save_state(state)
+                else:
+                    failed_report[sym] = errors
+            except Exception as exc:
+                logger.info("Process crashed: %s", exc)
 
     if failed_report:
-        logger.info(f"⚠️ Có {len(failed_report)} mã thất bại. Danh sách: {list(failed_report.keys())}")
-        with open("failed_report.json", "w", encoding="utf-8") as f:
+        logger.info("⚠️ %d symbols failed: %s", len(failed_report), list(failed_report.keys()))
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with FAILED_REPORT_FILE.open("w", encoding="utf-8") as f:
             json.dump(failed_report, f, ensure_ascii=False, indent=4)
 
 

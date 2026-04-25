@@ -27,12 +27,22 @@ class BankIncomeStatement(IncomeStatementBase):
     netFeeAndCommissionIncome: Optional[float] = None
     netOtherIncomeOrExpenses: Optional[float] = None
     interestAndSimilarExpenses: Optional[float] = None
+    # New fields for FireAnt
+    totalOperatingIncome: Optional[float] = None
+    totalOperatingExpense: Optional[float] = None
+    creditRiskProvisionsExpense: Optional[float] = None
+    interestAndSimilarIncome: Optional[float] = None
 
 
 class NonBankIncomeStatement(IncomeStatementBase):
     totalRevenue: Optional[float] = None
     netRevenue: Optional[float] = None
     netProfit: Optional[float] = None
+    # New fields for FireAnt
+    grossProfit: Optional[float] = None
+    costOfGoodsSold: Optional[float] = None
+    sellingExpense: Optional[float] = None
+    managingExpense: Optional[float] = None
 
 
 class BankBalanceSheet(BalanceSheetBase):
@@ -45,6 +55,16 @@ class BankBalanceSheet(BalanceSheetBase):
     depositsBorrowingsOthers: Optional[float] = None
     depositsFromCustomers: Optional[float] = None
     convertibleAndOtherPapers: Optional[float] = None
+    # New fields for FireAnt
+    customerLoan: Optional[float] = None
+    standardDebt: Optional[float] = None
+    watchlistDebt: Optional[float] = None
+    substandardDebt: Optional[float] = None
+    doubtfulDebt: Optional[float] = None
+    badDebt: Optional[float] = None
+    provisionForCustomerLoanLoss: Optional[float] = None
+    issuingValuablePaper: Optional[float] = None
+    totalEquity: Optional[float] = None
 
 
 class NonBankBalanceSheet(BalanceSheetBase):
@@ -56,6 +76,9 @@ class NonBankBalanceSheet(BalanceSheetBase):
     shortTermBorrowings: Optional[float] = None
     longTermBorrowings: Optional[float] = None
     advancesFromCustomers: Optional[float] = None
+    # New fields for FireAnt
+    inProgressLongTermAsset: Optional[float] = None
+    convertibleBond: Optional[float] = None
 
 
 class FinancialIndicatorBase(BaseModel):
@@ -70,15 +93,42 @@ class FinancialIndicatorBase(BaseModel):
     eps: Optional[float] = None
     bvps: Optional[float] = None
     cplh: Optional[float] = None
+    # New common fields for FireAnt
+    grossMargin: Optional[float] = None
+    netMargin: Optional[float] = None
+    saleGrowth: Optional[float] = None
+    profitGrowth: Optional[float] = None
+    currentRatio: Optional[float] = None
+    totalDebtOverEquity: Optional[float] = None
+    evOverEbitda: Optional[float] = None
+    inventoryTurnover: Optional[float] = None
+    payoutRatio: Optional[float] = None
+    cashDividend: Optional[float] = None
+    shareAtPeriodEnd: Optional[float] = None
 
 
 class BankFinancialIndicator(FinancialIndicatorBase):
-    pass
+    nim: Optional[float] = None
+    yoea: Optional[float] = None
+    cof: Optional[float] = None
+    cir: Optional[float] = None
+    ldr: Optional[float] = None
+    nplToLoan: Optional[float] = None
+    loanlossReservesToNPL: Optional[float] = None
 
 
 class NonBankFinancialIndicator(FinancialIndicatorBase):
     lng: Optional[float] = None
     lnr: Optional[float] = None
+
+
+class CashFlowStatement(BaseModel):
+    companyId: str
+    year: int
+    quarter: int
+    operatingCashflow: Optional[float] = None
+    investingCashflow: Optional[float] = None
+    financingCashflow: Optional[float] = None
 
 
 class IndustryNodeModel(BaseModel):

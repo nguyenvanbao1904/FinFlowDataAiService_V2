@@ -40,12 +40,10 @@ class Settings(BaseSettings):
     # align tx type to the category type instead of leaving an inconsistent pair.
     PREFILL_ENFORCE_TYPE_CATEGORY_CONSISTENCY: bool = True
 
-    # Vnstock
-    VNSTOCK_API_KEY: str = ""
-
-    # FireAnt (optional — company profile, ICB tree)
+    # FireAnt (financial data, company profile, ICB tree)
     FIREANT_ACCESS_TOKEN: str = ""
     FIREANT_API_BASE: str = "https://restv2.fireant.vn"
+    CRAWLER_STATE_DIR: str = str(_SERVICE_ROOT / "artifacts" / "crawler")
 
     # Export script / optional DB (same MySQL as Spring backend)
     FINFLOW_DATABASE_URL: str = ""
