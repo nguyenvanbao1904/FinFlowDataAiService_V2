@@ -179,6 +179,15 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
             forecast_profit_dong = float(forecast_profit) * 1e9
             forward_eps = forecast_profit_dong / float(cplh)
 
+        logger.info(
+            "[VALUATION] symbol=%s roe=%.4f eps=%.2f bvps=%.2f cplh=%s "
+            "live_price=%.0f forward_eps=%.2f cagr=%s g=%.4f coe=%.2f "
+            "median_pe=%s median_pb=%s forecast_profit=%s profit_history_len=%d",
+            args.get("symbol"), roe, eps, bvps, cplh,
+            live_price, forward_eps, cagr, g, coe,
+            median_pe, median_pb, forecast_profit, len(profit_history),
+        )
+
         # ── Compute target multiples ──
         if roe <= 0 or (coe - g) <= 0:
             # Can't compute — use median-based approach
@@ -189,16 +198,15 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
             pe_target = pb_target / roe
 
             # ── Cross-check with historical medians ──
-            # If Gordon-derived P/E deviates too far from historical median,
-            # blend toward median to avoid extreme outliers.
-            if median_pe and median_pe > 0:
+            # Blend Gordon-derived multiples toward historical medians when
+            # they diverge too much, to keep output grounded in market reality.
+            # Skip when median_pe looks like bad data (< 3).
+            if median_pe and float(median_pe) >= 3:
                 pe_ratio = pe_target / float(median_pe)
-                if pe_ratio > 2.0:
-                    # Gordon P/E is >2x median — cap at 1.5x median
-                    pe_target = float(median_pe) * 1.5
+                if pe_ratio > 1.5:
+                    pe_target = float(median_pe) * 1.3
                     pb_target = pe_target * roe
                 elif pe_ratio < 0.5:
-                    # Gordon P/E is <0.5x median — floor at 0.7x median
                     pe_target = float(median_pe) * 0.7
                     pb_target = pe_target * roe
 
@@ -285,6 +293,9 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
             "upside_pct": round(upside_pct, 1),
             "verdict": verdict,
             "rationale": playbook_entry.get("rationale", ""),
+            "forecast_series": forecast_series if forecast_series else None,
+            "forecast_top_factors": args.get("forecast_top_factors") or None,
+            "forecast_quality": args.get("forecast_quality") or None,
             "symbol": args.get("symbol", ""),
             "company_name": args.get("company_name", ""),
             "target_year": args.get("target_year", ""),
@@ -306,6 +317,17 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
         return {"error": f"Lỗi tính toán: {str(exc)}"}
 
 
+def _normalize_to_ty(value: float) -> float:
+    """Normalize profit value to tỷ đồng.
+
+    Backend financial series returns profit in đồng (e.g. 16_789_000_000_000).
+    Forecast service returns profit in tỷ đồng (e.g. 17_252).
+    """
+    if abs(value) >= 1e9:
+        return value / 1e9
+    return value
+
+
 def _compute_forecast_profit_cagr(
     profit_history: list[Any],
     forecast_series: list[Any],
@@ -323,7 +345,7 @@ def _compute_forecast_profit_cagr(
         if year is None or profit is None:
             continue
         try:
-            parsed = (int(year), float(profit))
+            parsed = (int(year), _normalize_to_ty(float(profit)))
         except (ValueError, TypeError):
             continue
         if parsed[1] > 0:
@@ -338,7 +360,7 @@ def _compute_forecast_profit_cagr(
         if year is None or profit is None:
             continue
         try:
-            parsed = (int(year), float(profit))
+            parsed = (int(year), _normalize_to_ty(float(profit)))
         except (ValueError, TypeError):
             continue
         if parsed[1] > 0:

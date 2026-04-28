@@ -525,7 +525,7 @@ class ChatOrchestrator:
                 ),
                 self._tool_client.execute_tool_call(
                     "get_company_financial_series",
-                    {"symbol": symbol, "annualLimit": 5},
+                    {"symbol": symbol, "annualLimit": 6},
                 ),
                 self._tool_client.execute_tool_call(
                     "get_company_daily_valuations",
@@ -565,7 +565,7 @@ class ChatOrchestrator:
         # ── Extract fields ──
         overview = (metrics_r.get("data") or {}).get("overview") or {}
 
-        # Profit history from financial series.
+        # Profit history from financial series (annual points only, full-year = 4 quarters).
         fin_data = financial_r.get("data") or {}
         raw_entries = fin_data.get("nonBank") or fin_data.get("bank") or []
         profit_history = [
@@ -576,6 +576,7 @@ class ChatOrchestrator:
             for item in raw_entries
             if isinstance(item, dict) and "year" in item
             and (item.get("quarter") is None or item.get("quarter") == 0)
+            and item.get("quarterCount", 0) == 4
         ]
 
         # Daily valuations summary.
@@ -588,6 +589,8 @@ class ChatOrchestrator:
 
         # Forecasts are non-critical; use the horizon when available for forward valuation.
         forecast_series = []
+        forecast_top_factors: dict = {}
+        forecast_quality: dict = {}
         for result in forecast_results:
             data = result.get("data") if result.get("ok") else None
             if isinstance(data, dict):
@@ -597,6 +600,10 @@ class ChatOrchestrator:
                     "profit_pred": data.get("profit_pred"),
                     "feature_year": data.get("feature_year"),
                 })
+                if data.get("top_factors") and not forecast_top_factors:
+                    forecast_top_factors = data["top_factors"]
+                if data.get("quality") and not forecast_quality:
+                    forecast_quality = data["quality"]
         forecast_data = next(
             (
                 item for item in forecast_series
@@ -613,13 +620,15 @@ class ChatOrchestrator:
             "profit_history": profit_history,
             "industry_icb_code": overview.get("industryIcbCode"),
             "industry_label": overview.get("industryLabel"),
-            "median_pe": daily_summary.get("pe_median"),
-            "median_pb": daily_summary.get("pb_median"),
-            "median_ps": daily_summary.get("ps_median"),
+            "median_pe": overview.get("medianPE") or daily_summary.get("pe_median"),
+            "median_pb": overview.get("medianPB") or daily_summary.get("pb_median"),
+            "median_ps": overview.get("medianPS") or daily_summary.get("ps_median"),
             "live_ps": live_data.get("livePs"),
             "forecast_profit": forecast_data.get("profit_pred"),
             "forecast_revenue": forecast_data.get("revenue_pred"),
             "forecast_series": forecast_series,
+            "forecast_top_factors": forecast_top_factors,
+            "forecast_quality": forecast_quality,
             "cplh": overview.get("cplh", 0),
             "symbol": symbol,
             "target_year": yr,

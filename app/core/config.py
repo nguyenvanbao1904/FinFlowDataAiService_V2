@@ -23,8 +23,8 @@ class Settings(BaseSettings):
 
     # AI (DeepSeek)
     DEEPSEEK_API_KEY: str = ""
-    DEEPSEEK_MODEL: str = "deepseek-chat"
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+    DEEPSEEK_USE_REASONER: bool = False
     LLM_TIMEOUT_SECONDS: int = 60
 
 
@@ -85,9 +85,25 @@ class Settings(BaseSettings):
     CHAT_FORECAST_ON_DEMAND_TIMEOUT_SECONDS: int = 180
     CHAT_FORECAST_TOP_FACTORS: int = 5
 
-    # DeepSeek price snapshot (USD per 1M tokens)
-    CHAT_DEEPSEEK_INPUT_PRICE_PER_1M: float = 0.10
-    CHAT_DEEPSEEK_OUTPUT_PRICE_PER_1M: float = 0.40
+    @property
+    def DEEPSEEK_MODEL(self) -> str:
+        return "deepseek-reasoner" if self.DEEPSEEK_USE_REASONER else "deepseek-chat"
+
+    @property
+    def DEEPSEEK_ENABLE_THINKING(self) -> bool:
+        return self.DEEPSEEK_USE_REASONER
+
+    @property
+    def CHAT_DEEPSEEK_INPUT_PRICE_PER_1M(self) -> float:
+        return 0.55 if self.DEEPSEEK_USE_REASONER else 0.10
+
+    @property
+    def CHAT_DEEPSEEK_OUTPUT_PRICE_PER_1M(self) -> float:
+        return 2.19 if self.DEEPSEEK_USE_REASONER else 0.40
+
+    @property
+    def effective_llm_timeout(self) -> int:
+        return max(self.LLM_TIMEOUT_SECONDS, 120) if self.DEEPSEEK_USE_REASONER else self.LLM_TIMEOUT_SECONDS
 
 
 settings = Settings()

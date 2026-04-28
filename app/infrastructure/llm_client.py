@@ -57,11 +57,12 @@ class LLMClient:
 
     def __init__(self) -> None:
         self.api_key = (settings.DEEPSEEK_API_KEY or "").strip()
-        self.model = (settings.DEEPSEEK_MODEL or "deepseek-chat").strip()
+        self.model = settings.DEEPSEEK_MODEL
+        self.enable_thinking = settings.DEEPSEEK_ENABLE_THINKING
         self.base_url = (settings.DEEPSEEK_BASE_URL or "https://api.deepseek.com").strip().rstrip("/")
-        self.timeout_seconds = max(5, int(settings.LLM_TIMEOUT_SECONDS))
-        self.input_price_per_1m = float(settings.CHAT_DEEPSEEK_INPUT_PRICE_PER_1M)
-        self.output_price_per_1m = float(settings.CHAT_DEEPSEEK_OUTPUT_PRICE_PER_1M)
+        self.timeout_seconds = max(5, settings.effective_llm_timeout)
+        self.input_price_per_1m = settings.CHAT_DEEPSEEK_INPUT_PRICE_PER_1M
+        self.output_price_per_1m = settings.CHAT_DEEPSEEK_OUTPUT_PRICE_PER_1M
         self.debug_log_prompts = bool(settings.CHAT_DEBUG_LOG_PROMPTS)
         self.debug_log_max_chars = max(500, int(settings.CHAT_DEBUG_LOG_MAX_CHARS))
 
@@ -190,7 +191,7 @@ class LLMClient:
         stage: str = "agent",
         max_retries: int = 2,
         model_override: str | None = None,
-        enable_thinking: bool = True,
+        enable_thinking: bool | None = None,
     ) -> LLMToolResponse:
         """Make a tool-calling LLM call for the ReAct agent loop.
 
@@ -203,6 +204,8 @@ class LLMClient:
         if not self.api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is missing")
 
+        thinking = enable_thinking if enable_thinking is not None else self.enable_thinking
+
         endpoint = f"{self.base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -214,10 +217,9 @@ class LLMClient:
             "max_tokens": max_output_tokens,
             "messages": messages,
         }
-        if enable_thinking:
+        if thinking:
             payload["thinking"] = {"type": "enabled"}
-            # Reasoner generally prefers higher timeout and max_tokens but follows payload rules
-        
+
         if tools:
             payload["tools"] = tools
 

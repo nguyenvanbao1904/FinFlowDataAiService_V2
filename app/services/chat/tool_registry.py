@@ -42,6 +42,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     _tool(
         "get_company_financial_series",
         "Doanh thu, lợi nhuận, ROE, ROA, biên lãi theo năm/quý từ DB báo cáo tài chính. "
+        "Backend ĐÃ TÍNH SẴN tăng trưởng YoY cho từng chỉ tiêu: yoyGrowth (LNST), "
+        "yoyNetRevenue (DT thuần, non-bank), yoyCustomerLoan (cho vay KH, bank), "
+        "yoyTotalOperatingIncome (TOI, bank), yoyNpl (nợ xấu, bank), yoyInventories (hàng tồn, non-bank). "
+        "KHÔNG cần tự tính YoY — dùng trực tiếp giá trị đã có. "
         "Dùng khi cần phân tích sức khỏe tài chính, tăng trưởng, hiệu quả hoạt động. "
         "Mặc định annualLimit=3 nếu không chỉ định.",
         {
@@ -172,11 +176,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     ),
     _tool(
         "search_annual_reports",
-        "Tìm kiếm thông tin từ báo cáo thường niên (~50 công ty, 5 năm gần nhất). "
-        "Dùng khi cần thông tin định tính: chiến lược kinh doanh, rủi ro, quản trị, kế hoạch mở rộng, triển vọng ngành.",
+        "Tìm kiếm thông tin định tính từ báo cáo thường niên (~700 công ty, 5 năm 2019-2024). "
+        "Dùng khi cần: chiến lược kinh doanh, rủi ro, quản trị, kế hoạch mở rộng, triển vọng ngành, "
+        "giải thích nguyên nhân biến động tài chính, hoặc bổ sung bối cảnh cho phân tích định giá. "
+        "NÊN gọi sau compute_fair_value để bổ sung góc nhìn chiến lược cho định giá.",
         {
             "ticker": {"type": "string", "description": "Mã cổ phiếu"},
-            "query": {"type": "string", "description": "Câu hỏi hoặc từ khóa tìm kiếm"},
+            "query": {"type": "string", "description": "Câu hỏi hoặc từ khóa tìm kiếm. VD: 'chiến lược kinh doanh và rủi ro', 'kế hoạch mở rộng tín dụng'"},
         },
         required=["ticker", "query"],
     ),
@@ -184,10 +190,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "compute_fair_value",
         "Tính giá trị hợp lý cổ phiếu. Tool TỰ LẤY toàn bộ dữ liệu cần thiết và tính toán. "
         "Chỉ cần truyền mã cổ phiếu. KHÔNG cần gọi tool nào khác trước khi gọi tool này. "
-        "Kết quả gồm: P/E target, P/B target, giá hợp lý, so sánh với giá hiện tại, verdict.",
+        "Nếu user nói 'tầm nhìn 2030' hoặc chỉ rõ năm → truyền target_year. "
+        "Kết quả gồm: P/E target, P/B target, giá hợp lý, verdict, forecast_series (lộ trình LNST/DT tới năm mục tiêu), "
+        "forecast_top_factors (yếu tố ảnh hưởng dự phóng từ mô hình ML), growth_source (forecast hoặc historical).",
         {
             "symbol": {"type": "string", "description": "Mã cổ phiếu, VD: FRT, HPG, VCB"},
-            "target_year": {"type": "integer", "description": "Năm dự báo (mặc định năm sau)"},
+            "target_year": {"type": "integer", "description": "Năm mục tiêu định giá. VD: user nói 'tầm nhìn 2030' → 2030. Không truyền = năm sau."},
         },
         required=["symbol"],
     ),
