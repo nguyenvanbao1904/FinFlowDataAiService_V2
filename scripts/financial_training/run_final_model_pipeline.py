@@ -16,13 +16,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.financial_training.db_data_loader import load_bank_annual, load_nonbank_annual
 from scripts.financial_training.industry_train_features import _slug
 
 
 COMMON_MACROS = [
-    "gdp_ty_dong_log",
+    "gdp_growth_yoy_pct",
     "cpi_inflation_yoy_pp",
-    "usd_vnd_log",
+    "usd_vnd_yoy_pct",
     "interest_deposit_12m_pct",
     "interest_loan_midlong_pct",
 ]
@@ -34,25 +35,25 @@ SECTOR_MACRO_MAPPINGS: dict[str, dict[str, Any]] = {
     },
     "CH_BI_N_THUY_S_N": {
         "name": "Nganh Thuy san",
-        "specific_macros": ["usd_vnd_log", "bdry_shipping_etf_log"],
+        "specific_macros": ["usd_vnd_yoy_pct", "bdry_shipping_etf_log"],
     },
     "S_N_XU_T_TH_C_PH_M": {
         "name": "Nganh Thuc pham (alias cho VHC/ANV trong map hien tai)",
-        "specific_macros": ["usd_vnd_log", "bdry_shipping_etf_log"],
+        "specific_macros": ["usd_vnd_yoy_pct", "bdry_shipping_etf_log"],
     },
     "S_N_XU_T_V_T_LI_U_X_Y_D_NG": {
         "name": "Vat lieu xay dung",
-        "specific_macros": ["interest_loan_midlong_pct", "usd_vnd_log"],
+        "specific_macros": ["interest_loan_midlong_pct", "usd_vnd_yoy_pct"],
     },
     "X_Y_D_NG_V_V_T_LI_U_X_Y_D_NG": {
         "name": "Xay dung va VLXD (alias cho VCS trong map hien tai)",
-        "specific_macros": ["interest_loan_midlong_pct", "usd_vnd_log"],
+        "specific_macros": ["interest_loan_midlong_pct", "usd_vnd_yoy_pct"],
     },
     "U_T_B_T_NG_S_N_V_D_CH_V": {
         "name": "Bat dong san va Dich vu",
         "specific_macros": [
             "cpi_inflation_yoy_pp",
-            "gdp_ty_dong_log",
+            "gdp_growth_yoy_pct",
             "interest_loan_short_pct",
             "interest_loan_midlong_pct",
         ],
@@ -98,6 +99,16 @@ PERCENT_LIKE_COLUMNS = [
     "interest_deposit_12m_pct",
     "interest_loan_short_pct",
     "interest_loan_midlong_pct",
+    "npl_to_loan",
+    "loanloss_reserves_to_npl",
+    "cir",
+    "ldr",
+    "cof",
+    "yoea",
+    "current_ratio",
+    "total_debt_over_equity",
+    "sale_growth",
+    "profit_growth",
 ]
 
 MACRO_LOG1P_NONNEGATIVE_COLUMNS = [
@@ -118,7 +129,12 @@ DEBT_INTEREST_ADJUSTMENT = {
 }
 
 
-def _model(objective: str) -> XGBRegressor:
+def _model(objective: str, huber_slope: float | None = None) -> XGBRegressor:
+    obj = objective
+    kwargs: dict[str, Any] = {}
+    if huber_slope is not None and huber_slope > 0:
+        obj = "reg:pseudohubererror"
+        kwargs["huber_slope"] = float(huber_slope)
     return XGBRegressor(
         n_estimators=450,
         learning_rate=0.03,
@@ -127,9 +143,10 @@ def _model(objective: str) -> XGBRegressor:
         colsample_bytree=0.9,
         reg_alpha=0.2,
         reg_lambda=2.0,
-        objective=objective,
+        objective=obj,
         random_state=42,
         n_jobs=-1,
+        **kwargs,
     )
 
 
@@ -662,6 +679,22 @@ def _prepare_signed_log_growth(
     return y_t, y_next, y_cur, valid
 
 
+def _winsorize_target(
+    y: pd.Series,
+    train_mask: np.ndarray,
+    lower_q: float,
+    upper_q: float,
+) -> pd.Series:
+    train_vals = y.loc[train_mask].dropna()
+    if train_vals.empty:
+        return y
+    lo = float(train_vals.quantile(lower_q))
+    hi = float(train_vals.quantile(upper_q))
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+        return y
+    return y.clip(lower=lo, upper=hi)
+
+
 def _inverse_signed_log_growth(pred_t: np.ndarray, cur: np.ndarray) -> np.ndarray:
     pred_t = np.clip(pred_t.astype(float), -3.0, 3.0)
     growth = np.sign(pred_t) * np.expm1(np.abs(pred_t))
@@ -911,6 +944,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Upper quantile clip for leverage ratio before thresholding.",
     )
     parser.add_argument(
+        "--profit-huber-slope",
+        type=float,
+        default=0,
+        help="Huber delta for profit model. >0 enables reg:pseudohubererror instead of reg:absoluteerror. 0 keeps MAE (default: off).",
+    )
+    parser.add_argument(
+        "--profit-winsorize-lower-q",
+        type=float,
+        default=0,
+        help="Lower quantile to winsorize profit target (train-only). 0 disables (default: off).",
+    )
+    parser.add_argument(
+        "--profit-winsorize-upper-q",
+        type=float,
+        default=0.98,
+        help="Upper quantile to winsorize profit target (train-only). Only used when lower-q > 0.",
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        choices=["db", "csv"],
+        default="db",
+        help="Data source: 'db' reads directly from MySQL, 'csv' reads preprocessed CSVs.",
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         default=ROOT / "artifacts" / "models" / "production_pipeline",
@@ -935,12 +993,19 @@ def main() -> None:
         if not (0.0 < float(args.debt_interest_high_q) < 1.0):
             raise ValueError("Debt-interest high quantile must be in (0, 1)")
 
-    bank = pd.read_csv(args.bank_preprocessed_csv)
-    nonbank = pd.read_csv(args.nonbank_preprocessed_csv)
-    if "quarter" in bank.columns:
-        bank = bank[bank["quarter"] == 0].copy().reset_index(drop=True)
-    if "quarter" in nonbank.columns:
-        nonbank = nonbank[nonbank["quarter"] == 0].copy().reset_index(drop=True)
+    if args.source == "db":
+        print("Loading data from DB...")
+        bank = load_bank_annual()
+        nonbank = load_nonbank_annual()
+        print(f"  Bank: {len(bank)} rows, {bank['symbol'].nunique()} symbols")
+        print(f"  Nonbank: {len(nonbank)} rows, {nonbank['symbol'].nunique()} symbols")
+    else:
+        bank = pd.read_csv(args.bank_preprocessed_csv)
+        nonbank = pd.read_csv(args.nonbank_preprocessed_csv)
+        if "quarter" in bank.columns:
+            bank = bank[bank["quarter"] == 0].copy().reset_index(drop=True)
+        if "quarter" in nonbank.columns:
+            nonbank = nonbank[nonbank["quarter"] == 0].copy().reset_index(drop=True)
 
     bank, dropped_bank_ids = _drop_identifier_columns(bank)
     nonbank, dropped_nonbank_ids = _drop_identifier_columns(nonbank)
@@ -982,8 +1047,15 @@ def main() -> None:
         "customer_deposits",
         "interbank_placements",
         "deposits_at_sbv",
-        "gdp_ty_dong_log",
-        "usd_vnd_log",
+        "npl_to_loan",
+        "loanloss_reserves_to_npl",
+        "cir",
+        "ldr",
+        "cof",
+        "yoea",
+        "credit_risk_provisions_expense",
+        "gdp_growth_yoy_pct",
+        "usd_vnd_yoy_pct",
         "interest_deposit_12m_pct",
         "interest_loan_short_pct",
         "interest_loan_midlong_pct",
@@ -1027,6 +1099,18 @@ def main() -> None:
         "asset_growth_yoy",
         "profit_margin_change",
         "revenue_momentum_delta",
+        "current_ratio",
+        "total_debt_over_equity",
+        "ev_over_ebitda",
+        "inventory_turnover",
+        "cost_of_goods_sold",
+        "selling_expense",
+        "managing_expense",
+        "operating_cashflow",
+        "investing_cashflow",
+        "financing_cashflow",
+        "sale_growth",
+        "profit_growth",
     ]
     if args.include_year_feature:
         nonbank_candidates = ["year"] + nonbank_candidates
@@ -1046,6 +1130,7 @@ def main() -> None:
         ("revenue_next", "revenue_current", "reg:squarederror"),
         ("profit_after_tax_next", "profit_after_tax", "reg:absoluteerror"),
     ]:
+        is_profit = "profit" in target
         d = bank[bank[target].notna()].copy().reset_index(drop=True)
         y_t, y_abs, y_cur, keep = _prepare_signed_log_growth(d, target, cur_col)
         d = d.loc[keep].reset_index(drop=True)
@@ -1064,6 +1149,9 @@ def main() -> None:
             exp_base=args.recency_weight_exp_base,
         )
 
+        if is_profit and args.profit_winsorize_lower_q > 0:
+            y_t = _winsorize_target(y_t, tr, args.profit_winsorize_lower_q, args.profit_winsorize_upper_q)
+
         clip_bounds: dict[str, tuple[float, float]] = {}
         d_model = d
         if args.enable_robust_clip:
@@ -1078,7 +1166,8 @@ def main() -> None:
             robust_clip_columns_used.update(clip_bounds.keys())
 
         X = _clean_X(d_model, bank_features)
-        m = _model(obj)
+        huber = args.profit_huber_slope if is_profit and args.profit_huber_slope > 0 else None
+        m = _model(obj, huber_slope=huber)
         m.fit(X.loc[tr], y_t.loc[tr], sample_weight=w_tr)
         p_t = m.predict(X.loc[te])
         p_abs = _inverse_signed_log_growth(p_t, y_cur.loc[te].to_numpy(dtype=float))
@@ -1128,6 +1217,7 @@ def main() -> None:
         ("revenue_next", "revenue_current", "reg:squarederror"),
         ("profit_after_tax_next", "profit_after_tax", "reg:absoluteerror"),
     ]:
+        is_profit = "profit" in target
         d = nonbank[nonbank[target].notna()].copy().reset_index(drop=True)
         y_t, y_abs, y_cur, keep = _prepare_signed_log_growth(d, target, cur_col)
         d = d.loc[keep].reset_index(drop=True)
@@ -1145,6 +1235,9 @@ def main() -> None:
             min_weight=args.recency_weight_min,
             exp_base=args.recency_weight_exp_base,
         )
+
+        if is_profit and args.profit_winsorize_lower_q > 0:
+            y_t = _winsorize_target(y_t, tr, args.profit_winsorize_lower_q, args.profit_winsorize_upper_q)
 
         clip_bounds: dict[str, tuple[float, float]] = {}
         d_model = d
@@ -1173,7 +1266,8 @@ def main() -> None:
             sample_weight=w_tr,
         )
         X = _clean_X(d_model, feats)
-        m = _model(obj)
+        huber = args.profit_huber_slope if is_profit and args.profit_huber_slope > 0 else None
+        m = _model(obj, huber_slope=huber)
         m.fit(X.loc[tr], y_t.loc[tr], sample_weight=w_tr)
         p_t = m.predict(X.loc[te])
         p_abs = _inverse_signed_log_growth(p_t, y_cur.loc[te].to_numpy(dtype=float))
@@ -1368,6 +1462,9 @@ def main() -> None:
             "debt_interest_upper_q": float(args.debt_interest_upper_q),
             "debt_interest_params": debt_interest_params,
             "debt_interest_applied": bool(debt_interest_applied),
+            "profit_huber_slope": float(args.profit_huber_slope),
+            "profit_winsorize_lower_q": float(args.profit_winsorize_lower_q),
+            "profit_winsorize_upper_q": float(args.profit_winsorize_upper_q),
             "dropped_identifier_columns": dropped_id_cols,
             "scaled_percent_columns": scaled_pct_cols,
             "log1p_nonnegative_macro_columns": logged_macro_cols,

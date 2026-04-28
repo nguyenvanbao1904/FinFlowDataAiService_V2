@@ -13,13 +13,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.financial_training.db_data_loader import load_bank_annual, load_nonbank_annual
 from scripts.financial_training.industry_train_features import _slug
 
 
 COMMON_MACROS = [
-    "gdp_ty_dong_log",
+    "gdp_growth_yoy_pct",
     "cpi_inflation_yoy_pp",
-    "usd_vnd_log",
+    "usd_vnd_yoy_pct",
     "interest_deposit_12m_pct",
     "interest_loan_midlong_pct",
 ]
@@ -31,25 +32,25 @@ SECTOR_MACRO_MAPPINGS: dict[str, dict[str, Any]] = {
     },
     "CH_BI_N_THUY_S_N": {
         "name": "Nganh Thuy san",
-        "specific_macros": ["usd_vnd_log", "bdry_shipping_etf_log"],
+        "specific_macros": ["usd_vnd_yoy_pct", "bdry_shipping_etf_log"],
     },
     "S_N_XU_T_TH_C_PH_M": {
         "name": "Nganh Thuc pham (alias cho VHC/ANV trong map hien tai)",
-        "specific_macros": ["usd_vnd_log", "bdry_shipping_etf_log"],
+        "specific_macros": ["usd_vnd_yoy_pct", "bdry_shipping_etf_log"],
     },
     "S_N_XU_T_V_T_LI_U_X_Y_D_NG": {
         "name": "Vat lieu xay dung",
-        "specific_macros": ["interest_loan_midlong_pct", "usd_vnd_log"],
+        "specific_macros": ["interest_loan_midlong_pct", "usd_vnd_yoy_pct"],
     },
     "X_Y_D_NG_V_V_T_LI_U_X_Y_D_NG": {
         "name": "Xay dung va VLXD (alias cho VCS trong map hien tai)",
-        "specific_macros": ["interest_loan_midlong_pct", "usd_vnd_log"],
+        "specific_macros": ["interest_loan_midlong_pct", "usd_vnd_yoy_pct"],
     },
     "U_T_B_T_NG_S_N_V_D_CH_V": {
         "name": "Bat dong san va Dich vu",
         "specific_macros": [
             "cpi_inflation_yoy_pp",
-            "gdp_ty_dong_log",
+            "gdp_growth_yoy_pct",
             "interest_loan_short_pct",
             "interest_loan_midlong_pct",
         ],
@@ -95,6 +96,16 @@ PERCENT_LIKE_COLUMNS = [
     "interest_deposit_12m_pct",
     "interest_loan_short_pct",
     "interest_loan_midlong_pct",
+    "npl_to_loan",
+    "loanloss_reserves_to_npl",
+    "cir",
+    "ldr",
+    "cof",
+    "yoea",
+    "current_ratio",
+    "total_debt_over_equity",
+    "sale_growth",
+    "profit_growth",
 ]
 
 MACRO_LOG1P_NONNEGATIVE_COLUMNS = [
@@ -601,6 +612,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top-features", type=int, default=8, help="Top feature drivers to print for each yearly prediction")
     parser.add_argument("--out-csv", type=Path, default=None)
+    parser.add_argument(
+        "--source",
+        type=str,
+        choices=["db", "csv"],
+        default="db",
+        help="Data source: 'db' reads directly from MySQL, 'csv' reads preprocessed CSVs.",
+    )
     return parser
 
 
@@ -613,12 +631,16 @@ def main() -> None:
 
     paths = _resolve_model_paths(args)
 
-    bank = pd.read_csv(args.bank_preprocessed_csv)
-    nonbank = pd.read_csv(args.nonbank_preprocessed_csv)
-    if "quarter" in bank.columns:
-        bank = bank[bank["quarter"] == 0].copy().reset_index(drop=True)
-    if "quarter" in nonbank.columns:
-        nonbank = nonbank[nonbank["quarter"] == 0].copy().reset_index(drop=True)
+    if args.source == "db":
+        bank = load_bank_annual()
+        nonbank = load_nonbank_annual()
+    else:
+        bank = pd.read_csv(args.bank_preprocessed_csv)
+        nonbank = pd.read_csv(args.nonbank_preprocessed_csv)
+        if "quarter" in bank.columns:
+            bank = bank[bank["quarter"] == 0].copy().reset_index(drop=True)
+        if "quarter" in nonbank.columns:
+            nonbank = nonbank[nonbank["quarter"] == 0].copy().reset_index(drop=True)
 
     bank, _ = _drop_identifier_columns(bank)
     nonbank, _ = _drop_identifier_columns(nonbank)

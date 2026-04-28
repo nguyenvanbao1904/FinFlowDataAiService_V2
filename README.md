@@ -253,17 +253,48 @@ Hệ thống dùng **2 pipeline** riêng biệt, mỗi pipeline gồm 4 XGBoost 
 
 **Chatbot chỉ đọc `production_pipeline`** — config trong `app/core/config.py` (các biến `CHAT_FORECAST_*`) trỏ vào thư mục này.
 
-#### Train pipeline
+#### Bước 1: Build macro data
+
+Trước khi train model, cần build file CSV chứa dữ liệu vĩ mô hàng năm (GDP growth, CPI, tỷ giá, hàng hóa, VNINDEX).
 
 ```bash
-# Eval pipeline — để đánh giá model quality
+# Tự động fetch từ FireAnt API + yfinance (cần FIREANT_ACCESS_TOKEN trong .env)
+python scripts/financial_training/build_macro_data.py
+
+# Nếu không có API token, dùng fallback data có sẵn trong code
+python scripts/financial_training/build_macro_data.py --skip-fireant --skip-yfinance
+
+# Bao gồm năm hiện tại (dữ liệu chưa đầy đủ)
+python scripts/financial_training/build_macro_data.py --include-current-year
+```
+
+Output: `artifacts/macro/macro_yearly_train.csv` (nonbank, 18 cols) và `macro_yearly_train_bank.csv` (bank, 17 cols).
+
+Dữ liệu nguồn:
+
+| Nguồn | Features |
+|-------|----------|
+| FireAnt API | `gdp_growth_yoy_pct` (GDP Annual Growth Rate), `cpi_inflation_yoy_pp`, VNINDEX daily quotes |
+| yfinance | `usd_vnd_yoy_pct`, `gold_gc_log`, `oil_brent_log`, `nat_gas_log`, `sugar_log`, `coffee_log`, `rice_log`, `bdry_shipping_etf_log` |
+| Manual in-code | `interest_deposit_12m_pct`, `interest_loan_short_pct`, `interest_loan_midlong_pct`, `hrc_log`, `iron_ore_log`, `coal_log`, `rubber_log` |
+
+GDP và USD/VND dùng **tốc độ tăng trưởng YoY %** (stationary) thay vì log giá trị tuyệt đối — giúp model extrapolate tốt hơn khi dự báo năm mới.
+
+Flags: `--start-year 2013`, `--end-year` (mặc định: năm trước), `--out-dir`, `--skip-fireant`, `--skip-yfinance`, `--include-current-year`.
+
+#### Bước 2: Train pipeline
+
+```bash
+# Eval pipeline — đánh giá model quality (có actual 2025 để so sánh)
 python scripts/financial_training/run_final_model_pipeline.py \
+  --source db \
   --train-target-year-max 2024 \
   --predict-target-year 2025 \
   --out-dir artifacts/models/eval_pipeline
 
 # Production pipeline — chatbot dùng
 python scripts/financial_training/run_final_model_pipeline.py \
+  --source db \
   --train-target-year-max 2025 \
   --predict-target-year 2026 \
   --out-dir artifacts/models/production_pipeline
@@ -271,36 +302,57 @@ python scripts/financial_training/run_final_model_pipeline.py \
 
 Output mỗi pipeline: 4 `.joblib` models + `report_table.csv` + `predict_detail.csv` + `summary.json` + `report_style.md`.
 
-Useful flags: `--symbols ACB,VEA,...` (symbols cho report), `--nonbank-feature-budget 50`, `--steel-boost 3.0`.
+Flags thường dùng:
 
-#### On-demand forecast (1 mã, nhiều năm)
+| Flag | Default | Mô tả |
+|------|---------|-------|
+| `--source db\|csv` | `db` | Đọc data từ MySQL hoặc CSV preprocessed |
+| `--symbols ACB,VEA,...` | `ACB,VEA,NLG,DGC,PNJ,MWG,VIB,VPB` | Symbols cho báo cáo so sánh |
+| `--nonbank-feature-budget` | `50` | Số features tối đa cho nonbank (RFE selection) |
+| `--steel-boost` | `1.0` | Hệ số tăng cường tương tác ngành thép |
+| `--recency-weight-mode` | `exp` | Trọng số theo thời gian: `none`, `linear`, `exp` |
+| `--enable-robust-clip` | `true` | Clip outlier ratio/percent columns theo quantile train |
+| `--enable-debt-interest-adjustment` | `true` | Tăng lãi suất cho DN đòn bẩy cao |
+| `--profit-huber-slope` | `0` | Huber loss cho profit (0=tắt, dùng MAE). Thử nghiệm cho thấy tắt tốt hơn |
+| `--profit-winsorize-lower-q` | `0` | Winsorize profit target (0=tắt). Thử nghiệm cho thấy tắt tốt hơn |
+
+> **Ghi chú thử nghiệm:** Huber loss + Winsorize đã được A/B test và cho kết quả kém hơn (R² profit rớt từ 0.920→0.884 VN30). Nguyên nhân: lợi nhuận bluechip biến động mạnh nhưng đó là tính chu kỳ thật, không phải nhiễu — nén lại sẽ phá hủy tín hiệu. Giữ code để thử nghiệm nhưng default = tắt.
+
+#### Bước 3: On-demand forecast (1 mã, nhiều năm)
 
 ```bash
 python scripts/financial_training/test_final_models_forecast.py \
   --symbol ACB --to-year 2030 \
-  --model-dir artifacts/models/production_pipeline
+  --model-dir artifacts/models/production_pipeline \
+  --source db
 ```
 
 Chatbot tự gọi script này khi user hỏi forecast cho mã không có sẵn trong `report_table.csv`. Kết quả cache vào `production_pipeline/on_demand/`.
 
+Flags: `--base-year 2025`, `--predict-target revenue|profit|both`, `--history-mode recursive|use-actual-when-available`, `--top-features 8`.
+
 #### Artifacts structure
 
 ```
-artifacts/models/
-├── eval_pipeline/                  # Đánh giá (train→2024, predict→2025)
-│   ├── bank_revenue_next.joblib
-│   ├── bank_profit_after_tax_next.joblib
-│   ├── nonbank_revenue_next.joblib
-│   ├── nonbank_profit_after_tax_next.joblib
-│   ├── report_table.csv            # Dự báo vs thực tế cho symbols đã chọn
-│   ├── predict_detail.csv          # Chi tiết từng mã
-│   ├── summary.json                # Config + metrics (WAPE, R², MAPE...)
-│   └── report_style.md             # Markdown report
-└── production_pipeline/            # Chatbot dùng (train→2025, predict→2026)
-    ├── (same 4 .joblib + 4 reports)
-    └── on_demand/                  # Cache on-demand forecasts
-        ├── forecast_ACB_2030.csv
-        └── forecast_ACB_2030_feature_drivers.csv
+artifacts/
+├── macro/
+│   ├── macro_yearly_train.csv          # Nonbank macro (18 cols, 2013-2025)
+│   └── macro_yearly_train_bank.csv     # Bank macro (17 cols, 2013-2025)
+└── models/
+    ├── eval_pipeline/                  # Đánh giá (train→2024, predict→2025)
+    │   ├── bank_revenue_next.joblib
+    │   ├── bank_profit_after_tax_next.joblib
+    │   ├── nonbank_revenue_next.joblib
+    │   ├── nonbank_profit_after_tax_next.joblib
+    │   ├── report_table.csv            # Dự báo vs thực tế cho symbols đã chọn
+    │   ├── predict_detail.csv          # Chi tiết từng mã
+    │   ├── summary.json                # Config + metrics (WAPE, R², MAPE...)
+    │   └── report_style.md             # Markdown report
+    └── production_pipeline/            # Chatbot dùng (train→2025, predict→2026)
+        ├── (same 4 .joblib + 4 reports)
+        └── on_demand/                  # Cache on-demand forecasts
+            ├── forecast_ACB_2025_2030.csv
+            └── forecast_ACB_2025_2030_feature_drivers.csv
 ```
 
 ### Annual Report RAG Chunking
