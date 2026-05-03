@@ -1,0 +1,71 @@
+# Golden dataset for chat eval. Each case represents a user behavior we
+# want to preserve across prompt/model/framework changes.
+#
+# Note: "expected_tool_names" is a soft signal — the LLM may pick alternative
+# valid tools. The evaluator scores partial overlap, not strict equality.
+
+- name: greeting_no_tool
+  inputs:
+    user_message: "Xin chào"
+    user_id: "u-eval"
+  expected_tool_names: []
+  expected_assistant_contains: []
+
+- name: hpg_fair_value
+  inputs:
+    user_message: "HPG có rẻ không, định giá thử xem"
+    user_id: "u-eval"
+  expected_tool_names:
+    - compute_fair_value
+  expected_assistant_contains:
+    - "HPG"
+
+- name: hpg_fair_value_target_year
+  inputs:
+    user_message: "Định giá HPG tầm nhìn 2030"
+    user_id: "u-eval"
+  expected_tool_names:
+    - compute_fair_value
+  expected_assistant_contains:
+    - "HPG"
+
+- name: vcb_quick_compare
+  inputs:
+    user_message: "VCB hiện đắt hay rẻ so với lịch sử?"
+    user_id: "u-eval"
+  expected_tool_names:
+    - get_company_live_valuation_snapshot
+  expected_assistant_contains:
+    - "VCB"
+
+- name: personal_finance_overview
+  inputs:
+    user_message: "Tình hình thu chi của tôi tháng này thế nào?"
+    user_id: "u-eval"
+  expected_tool_names:
+    - get_personal_finance_report
+  expected_assistant_contains: []
+
+- name: personal_finance_budget_list
+  inputs:
+    user_message: "Tôi đang đặt những ngân sách nào?"
+    user_id: "u-eval"
+  expected_tool_names:
+    - get_user_budgets
+  expected_assistant_contains: []
+
+- name: clarification_no_ticker
+  inputs:
+    user_message: "Định giá thử xem"
+    user_id: "u-eval"
+  expected_tool_names: []
+  expected_assistant_contains: []
+
+- name: financial_health_fpt
+  inputs:
+    user_message: "FPT 3 năm qua tăng trưởng thế nào?"
+    user_id: "u-eval"
+  expected_tool_names:
+    - get_company_financial_series
+  expected_assistant_contains:
+    - "FPT"

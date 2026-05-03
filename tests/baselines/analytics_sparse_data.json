@@ -1,0 +1,40 @@
+{
+  "llm_request": {
+    "max_tokens_eff": 400,
+    "messages": [
+      {
+        "content": "You are a concise Vietnamese personal finance insights generator. Return ONLY a raw JSON object. No markdown, no code fences, no prose. All numerical stats are pre-calculated. Do NOT perform any math — just quote the provided statistics and write human-readable insights.",
+        "role": "system"
+      },
+      {
+        "content": "STRICT RULES:\n- Generate exactly 2 insights: one WARNING and one TIP.\n- Title: short, descriptive, action-oriented. Do NOT include dates or time ranges in titles.\n- Message: short (<= 180 chars), practical, non-judgmental.\n- Do not invent data outside provided context.\n- Use Vietnamese.\n- insightTier=SPARSE: data is limited. Do NOT claim strong trends.\n- If CURRENT_DAY_OF_MONTH < 5, avoid concluding trend for CURRENT_MONTH_LABEL.\n- Give practical, general guidance (ghi đều, phân loại, theo dõi tuần) and acknowledge limited data briefly.\n\nRETURN SCHEMA:\n{\n  \"insights\": [\n    {\n      \"id\": string,\n      \"type\": \"WARNING\"|\"TIP\",\n      \"title\": string,\n      \"message\": string,\n      \"confidence\": number (keep <= 0.75)\n    }\n  ],\n  \"warnings\": string[]\n}\n\nCONTEXT:\nlocale=vi-VN\ntimezone=Asia/Ho_Chi_Minh\ncurrency=VND\nperiodLabel=THANG_NAY\ninsightTier=SPARSE\nasOfDate=2026-05-01\ncurrentDayOfMonth=1\ncurrentMonthLabel=tháng 5\npreviousMonthLabel=tháng 4\nlookbackLabel=3 tháng gần nhất\nrecentTransactionCount=5\ntotalIncomeLookback=2000000.0\ntotalExpenseLookback=1500000.0\nnetCashflowLookback=500000.0\npreviousMonthTopExpenseCategories=[{\"name\": \"Ăn uống\", \"amount\": 600000.0, \"sharePct\": 40.0}]\nmonthlySeries=[{\"month\": \"2026-03\", \"income\": 1000000.0, \"expense\": 750000.0, \"net\": 250000.0, \"topExpenseCategories\": []}, {\"month\": \"2026-04\", \"income\": 1000000.0, \"expense\": 750000.0, \"net\": 250000.0, \"topExpenseCategories\": []}]",
+        "role": "user"
+      }
+    ],
+    "model": "deepseek-chat",
+    "response_format": {
+      "type": "json_object"
+    },
+    "temperature": 0.0
+  },
+  "service_response": {
+    "cached": false,
+    "insights": [
+      {
+        "confidence": 0.6,
+        "id": "warn-1",
+        "message": "Dữ liệu còn ít. Ghi đều các giao dịch trong tháng tới.",
+        "title": "Theo dõi chi tiêu",
+        "type": "WARNING"
+      },
+      {
+        "confidence": 0.6,
+        "id": "tip-1",
+        "message": "Phân loại giao dịch theo danh mục để dễ so sánh.",
+        "title": "Mẹo phân loại",
+        "type": "TIP"
+      }
+    ],
+    "warnings": []
+  }
+}

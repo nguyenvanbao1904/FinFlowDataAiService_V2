@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from pathlib import Path
 from typing import Any
 
@@ -134,10 +133,18 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
         cplh: float              — Cổ phiếu lưu hành (optional, for forward EPS/revenue)
     """
     try:
-        eps = float(args.get("eps", 0))
-        bvps = float(args.get("bvps", 0))
-        roe = float(args.get("roe", 0))
-        live_price = float(args.get("live_price", 0))
+        def _to_float(v: Any, default: float = 0.0) -> float:
+            try:
+                if v is None:
+                    return default
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        eps = _to_float(args.get("eps"))
+        bvps = _to_float(args.get("bvps"))
+        roe = _to_float(args.get("roe"))
+        live_price = _to_float(args.get("live_price"))
         profit_history = args.get("profit_history", [])
         industry_icb_code = args.get("industry_icb_code")
         industry_label = args.get("industry_label")
@@ -157,7 +164,6 @@ def compute_fair_value(args: dict[str, Any]) -> dict[str, Any]:
         params = playbook_entry["params"]
         coe = params["default_coe"]
         default_g = params["default_growth"]
-        margin_pct = params.get("margin_pct", 10)
 
         # ── Compute growth: prefer forward forecast CAGR when the user asks for a future horizon.
         historical_cagr = _compute_profit_cagr(profit_history)

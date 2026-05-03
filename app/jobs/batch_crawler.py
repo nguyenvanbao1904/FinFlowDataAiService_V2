@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import Lock
 from app.core.config import settings

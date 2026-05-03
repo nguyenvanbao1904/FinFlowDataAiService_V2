@@ -4,19 +4,40 @@ import json
 import logging
 from typing import Any
 
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModelSettings
+
+from app.infrastructure.llm_agent import get_deepseek_model
 from app.models.analytics import (
     AnalyticsInsightItem,
     AnalyticsInsightsRequest,
     AnalyticsInsightsResponse,
 )
-from app.infrastructure.llm_client import LLMClient
+from app.services.chat.utils.json_io import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
 
+_SYSTEM_PROMPT = (
+    "You are a concise Vietnamese personal finance insights generator. "
+    "Return ONLY a raw JSON object. No markdown, no code fences, no prose. "
+    "All numerical stats are pre-calculated. Do NOT perform any math — "
+    "just quote the provided statistics and write human-readable insights."
+)
+
+
 class AnalyticsInsightsService:
     def __init__(self) -> None:
-        self.llm_client = LLMClient()
+        self._agent = Agent(
+            get_deepseek_model(),
+            system_prompt=_SYSTEM_PROMPT,
+            model_settings=OpenAIChatModelSettings(
+                temperature=0.0,
+                max_tokens=400,
+                extra_body={"response_format": {"type": "json_object"}},
+            ),
+            output_type=str,
+        )
 
     async def generate(self, request: AnalyticsInsightsRequest) -> AnalyticsInsightsResponse:
         if not self._has_activity_in_last_two_months(request):
@@ -43,24 +64,12 @@ class AnalyticsInsightsService:
             )
 
     async def _call_llm(self, request: AnalyticsInsightsRequest) -> dict[str, Any]:
-        prompt = self._build_prompt(request)
-        system_prompt = (
-            "You are a concise Vietnamese personal finance insights generator. "
-            "Return ONLY a raw JSON object. No markdown, no code fences, no prose. "
-            "All numerical stats are pre-calculated. Do NOT perform any math — "
-            "just quote the provided statistics and write human-readable insights."
-        )
-        
-        parsed, usage = await self.llm_client.call_json(
-            system_prompt=system_prompt,
-            user_prompt=prompt,
-            max_output_tokens=400,
-            stage="analytics",
-            enable_thinking=False,  # Simple NLP task: fast, uses response_format=json_object
-        )
+        result = await self._agent.run(self._build_prompt(request))
+        parsed = parse_llm_json(result.output)
+        if not isinstance(parsed, dict):
+            parsed = {}
         logger.info("Analytics LLM parsed keys=%s", list(parsed.keys()) if parsed else "EMPTY")
         return parsed
-
 
     def _build_prompt(self, request: AnalyticsInsightsRequest) -> str:
         if request.insightTier == "SPARSE":

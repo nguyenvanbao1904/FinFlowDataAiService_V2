@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 import logging
+import sys
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +14,27 @@ from app.routers import ai, chat
 logger = logging.getLogger(__name__)
 
 
+def _configure_logging() -> None:
+    """Set INFO level for our app modules when CHAT_TRACE_ENABLED is on,
+    otherwise keep WARNING to stay quiet alongside uvicorn."""
+    level = logging.INFO if settings.CHAT_TRACE_ENABLED else logging.WARNING
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    root = logging.getLogger("app")
+    root.setLevel(level)
+    if not root.handlers:
+        root.addHandler(handler)
+    root.propagate = False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _configure_logging()
+    if settings.CHAT_TRACE_ENABLED:
+        logger.info("[TRACE] Chat trace enabled — logs to stdout + %s", settings.CHAT_TRACE_DIR)
     yield
     await close_http_client()
 

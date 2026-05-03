@@ -1,0 +1,40 @@
+{
+  "llm_request": {
+    "max_tokens_eff": 400,
+    "messages": [
+      {
+        "content": "You are a concise Vietnamese personal finance insights generator. Return ONLY a raw JSON object. No markdown, no code fences, no prose. All numerical stats are pre-calculated. Do NOT perform any math — just quote the provided statistics and write human-readable insights.",
+        "role": "system"
+      },
+      {
+        "content": "STRICT RULES:\n- Generate exactly 2 insights: one WARNING and one TIP.\n- Title: short, descriptive, action-oriented (e.g. \"Cảnh báo chi ăn uống\", \"Cải thiện tỷ lệ tiết kiệm\"). Do NOT include dates or time ranges in titles.\n- Message: short (<= 180 chars), practical, non-judgmental. You may reference months (e.g. \"tháng 3\") in the message body when relevant.\n- Do not invent data outside provided context.\n- Use Vietnamese.\n- insightTier=FULL: interpret trends using MONTHLY_SERIES. Compare CURRENT_MONTH_LABEL vs PREVIOUS_MONTH_LABEL when relevant.\n- CRITICAL: If CURRENT_DAY_OF_MONTH < 5, DO NOT conclude trend for CURRENT_MONTH_LABEL.\n- UNIT CHECK: month-level claim → MONTHLY_SERIES or PREVIOUS_MONTH_TOP_EXPENSE_CATEGORIES; lookback-level claim → TOTAL_*_LOOKBACK.\n- PRIORITY: (1) lifestyle creep via PREVIOUS_MONTH_CATEGORY_DELTA, (2) savings discipline via SAVINGS_RATE_SERIES, (3) practical next step.\n- Do not claim yearly or all-time trends unless data supports it.\n\nRETURN SCHEMA:\n{\n  \"insights\": [\n    {\n      \"id\": string,\n      \"type\": \"WARNING\"|\"TIP\",\n      \"title\": string,\n      \"message\": string,\n      \"confidence\": number\n    }\n  ],\n  \"warnings\": string[]\n}\n\nCONTEXT:\nlocale=vi-VN\ntimezone=Asia/Ho_Chi_Minh\ncurrency=VND\nperiodLabel=THANG_NAY\ninsightTier=FULL\nasOfDate=2026-05-01\ncurrentDayOfMonth=1\nisBeginningOfMonth=True\ncurrentMonthLabel=tháng 5\npreviousMonthLabel=tháng 4\nlookbackLabel=3 tháng gần nhất\nrecentTransactionCount=42\ntotalIncomeLookback=60000000.0\ntotalExpenseLookback=42000000.0\nnetCashflowLookback=18000000.0\navgIncomePrev2Months=20000000.0\navgExpensePrev2Months=14000000.0\nsavingsRateSeries=[{\"month\": \"2026-03\", \"savingsRatePct\": 20.0}, {\"month\": \"2026-04\", \"savingsRatePct\": 25.0}]\npreviousMonthCategoryDelta=[{\"name\": \"Ăn uống\", \"previousAmount\": 4000000.0, \"baselineAvgAmount\": 3000000.0, \"deltaPct\": 33.3}]\npreviousMonthTopExpenseCategories=[{\"name\": \"Ăn uống\", \"amount\": 4000000.0, \"sharePct\": 28.5}, {\"name\": \"Đi lại\", \"amount\": 2000000.0, \"sharePct\": 14.2}]\nmonthlySeries=[{\"month\": \"2026-03\", \"income\": 20000000.0, \"expense\": 14000000.0, \"net\": 6000000.0, \"topExpenseCategories\": []}, {\"month\": \"2026-04\", \"income\": 20000000.0, \"expense\": 14000000.0, \"net\": 6000000.0, \"topExpenseCategories\": []}]",
+        "role": "user"
+      }
+    ],
+    "model": "deepseek-chat",
+    "response_format": {
+      "type": "json_object"
+    },
+    "temperature": 0.0
+  },
+  "service_response": {
+    "cached": false,
+    "insights": [
+      {
+        "confidence": 0.85,
+        "id": "warn-1",
+        "message": "Chi ăn uống tăng 33% so với trung bình. Theo dõi sát.",
+        "title": "Cảnh báo chi ăn uống",
+        "type": "WARNING"
+      },
+      {
+        "confidence": 0.8,
+        "id": "tip-1",
+        "message": "Đặt hạn mức cho danh mục Ăn uống để cân bằng dòng tiền.",
+        "title": "Cải thiện tiết kiệm",
+        "type": "TIP"
+      }
+    ],
+    "warnings": []
+  }
+}

@@ -4,44 +4,48 @@ import json
 import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Any
 
-from app.core.config import settings
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModelSettings
+
+from app.infrastructure.llm_agent import get_deepseek_model
 from app.models.transaction import (
     TransactionPrefillRequest,
     TransactionPrefillResponse,
 )
-from app.infrastructure.llm_client import LLMClient
+from app.services.chat.utils.json_io import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
 
+_SYSTEM_PROMPT = (
+    "You are a helpful financial assistant that extracts transaction details from text.\n"
+    "You must output exactly one JSON object and nothing else. "
+    "Do not output markdown, code format tags, or reasoning."
+)
+
+
 class TransactionPrefillService:
     def __init__(self) -> None:
-        self.llm_client = LLMClient()
+        self._agent = Agent(
+            get_deepseek_model(),
+            system_prompt=_SYSTEM_PROMPT,
+            model_settings=OpenAIChatModelSettings(
+                temperature=0.0,
+                max_tokens=300,
+                extra_body={"response_format": {"type": "json_object"}},
+            ),
+            output_type=str,
+            retries=2,
+        )
 
     async def prefill(self, request: TransactionPrefillRequest) -> TransactionPrefillResponse:
-        system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(request)
-        
-        # Use LLMClient's structured output with Pydantic validation + retry loop
-        raw_response, usage = await self.llm_client.call_structured(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_model=TransactionPrefillResponse,
-            max_output_tokens=300,
-            stage="prefill",
-            max_retries=2,
-        )
-
-        return self._normalize_output(raw_response, request)
-
-    def _build_system_prompt(self) -> str:
-        return (
-            "You are a helpful financial assistant that extracts transaction details from text.\n"
-            "You must output exactly one JSON object and nothing else. "
-            "Do not output markdown, code format tags, or reasoning."
-        )
+        result = await self._agent.run(self._build_user_prompt(request))
+        parsed = parse_llm_json(result.output)
+        if not isinstance(parsed, dict):
+            parsed = {}
+        response = TransactionPrefillResponse.model_validate(parsed)
+        return self._normalize_output(response, request)
 
     def _build_user_prompt(self, request: TransactionPrefillRequest) -> str:
         categories = [
@@ -60,7 +64,7 @@ class TransactionPrefillService:
         current_date_local = datetime.now(tz).isoformat(timespec="seconds")
 
         raw_text_block = self._sanitize_text(request.rawText)
-        
+
         return (
             "TASK: Extract one finance transaction from RAW_TEXT.\n"
             "OUTPUT: Return JSON with keys: amount (float), type ('INCOME' or 'EXPENSE'), categoryId, accountId, note, transactionDate, confidence (0.0-1.0), warnings (list).\n"
@@ -84,13 +88,15 @@ class TransactionPrefillService:
             f"{raw_text_block}\n"
         )
 
-    def _sanitize_text(self, text: str) -> str:
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
         cleaned = text.replace("\x00", " ").replace("\r", " ").strip()
         if len(cleaned) > 4000:
             cleaned = cleaned[:4000]
         return cleaned
 
-    def _safe_zoneinfo(self, timezone_name: str) -> ZoneInfo:
+    @staticmethod
+    def _safe_zoneinfo(timezone_name: str) -> ZoneInfo:
         try:
             return ZoneInfo(timezone_name)
         except Exception:
@@ -105,15 +111,15 @@ class TransactionPrefillService:
 
         warnings = output.warnings or []
         missing = output.missingFields or []
-        
+
         if output.amount is not None:
             if output.amount <= 0:
                 output.amount = None
-        
+
         if output.categoryId and output.categoryId not in allowed_categories:
             warnings.append("Hệ thống: categoryId không nằm trong danh sách cho phép")
             output.categoryId = None
-            
+
         if output.accountId and output.accountId not in allowed_accounts:
             warnings.append("Hệ thống: accountId không nằm trong danh sách cho phép")
             output.accountId = None
@@ -142,7 +148,7 @@ class TransactionPrefillService:
         for field_name, value in required_checks.items():
             if value is None and field_name not in missing:
                 missing.append(field_name)
-            
+
         output.missingFields = missing
         output.warnings = warnings[:10]
 

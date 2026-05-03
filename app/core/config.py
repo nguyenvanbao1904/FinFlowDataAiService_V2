@@ -2,7 +2,7 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Luôn đọc `.env` ở gốc package `data_ai_service/` (không phụ thuộc cwd khi chạy uvicorn từ repo root).
+# Always read `.env` from data_ai_service/ root, regardless of cwd.
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _ENV_FILE = _SERVICE_ROOT / ".env"
 
@@ -17,35 +17,29 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "FinFlow Data & AI Service"
     API_V1_STR: str = "/api/v1"
 
-    # Internal Java Backend URL
+    # Internal Java Backend
     JAVA_BACKEND_URL: str = "http://localhost:8080/api/internal"
     INTERNAL_API_KEY: str = ""
 
-    # AI (DeepSeek)
+    # DeepSeek LLM
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
-    DEEPSEEK_USE_REASONER: bool = False
+    DEEPSEEK_MODEL: str = "deepseek-chat"
     LLM_TIMEOUT_SECONDS: int = 60
+    CHAT_DEEPSEEK_INPUT_PRICE_PER_1M: float = 0.10
+    CHAT_DEEPSEEK_OUTPUT_PRICE_PER_1M: float = 0.40
 
-
-    # Local embedding model (OpenAI-compatible API)
+    # Local embedding (OpenAI-compatible API for RAG vector search)
     LOCAL_EMBEDDING_BASE_URL: str = ""
     LOCAL_EMBEDDING_API_KEY: str = "no-key-required"
     LOCAL_EMBEDDING_MODEL: str = ""
-
-    # Transaction prefill behavior:
-    # false => trust model output (strict mode), true => apply keyword-based category correction.
-    PREFILL_ENABLE_CATEGORY_HEURISTIC: bool = False
-    # Keep response structurally consistent for UI: if category type conflicts with tx type,
-    # align tx type to the category type instead of leaving an inconsistent pair.
-    PREFILL_ENFORCE_TYPE_CATEGORY_CONSISTENCY: bool = True
 
     # FireAnt (financial data, company profile, ICB tree)
     FIREANT_ACCESS_TOKEN: str = ""
     FIREANT_API_BASE: str = "https://restv2.fireant.vn"
     CRAWLER_STATE_DIR: str = str(_SERVICE_ROOT / "artifacts" / "crawler")
 
-    # Export script / optional DB (same MySQL as Spring backend)
+    # MySQL (used by export scripts / batch crawler — not by the FastAPI runtime)
     FINFLOW_DATABASE_URL: str = ""
     MYSQL_HOST: str = "127.0.0.1"
     MYSQL_PORT: int = 3306
@@ -56,15 +50,36 @@ class Settings(BaseSettings):
     # Chat orchestration
     CHAT_TOOL_TIMEOUT_SECONDS: int = 30
     CHAT_RAG_ENABLED: bool = True
-    CHAT_RAG_CHUNKS_DB: str = str(_SERVICE_ROOT / "artifacts" / "rag" / "annual_reports" / "chunks" / "annual_reports_chunks.sqlite")
+    CHAT_RAG_CHUNKS_DB: str = str(
+        _SERVICE_ROOT / "artifacts" / "rag" / "annual_reports" / "chunks"
+        / "annual_reports_chunks.sqlite"
+    )
     CHAT_QDRANT_URL: str = "http://127.0.0.1:6333"
     CHAT_QDRANT_API_KEY: str = ""
     CHAT_QDRANT_COLLECTION: str = "annual_report_chunks_bge_m3"
-    CHAT_RAG_TOPK_VECTOR: int = 6
-    CHAT_RAG_TOPK_KEYWORD: int = 6
+    CHAT_RAG_TOPK_VECTOR: int = 25
+    CHAT_RAG_TOPK_KEYWORD: int = 25
     CHAT_RAG_TOPK_FINAL: int = 6
+
+    # Reranker — re-scores hybrid-retrieved chunks with a cross-encoder.
+    # Recommended: keep enabled; vector + keyword retrieval is fast but
+    # coarse, the cross-encoder bumps top-6 precision by ~20-30%.
+    CHAT_RAG_RERANK_ENABLED: bool = True
+    CHAT_RAG_RERANK_URL: str = "http://127.0.0.1:9091/v1/rerank"
+    CHAT_RAG_RERANK_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    # Number of candidates fed into the reranker before keeping TOPK_FINAL.
+    CHAT_RAG_RERANK_CANDIDATES: int = 30
+    CHAT_RAG_RERANK_TIMEOUT_SECONDS: int = 30
     CHAT_DEBUG_LOG_PROMPTS: bool = False
     CHAT_DEBUG_LOG_MAX_CHARS: int = 8000
+
+    # Per-request trace files: dump full LLM I/O for every chat orchestrate
+    # request to a JSON file. Use for debugging — leave OFF in production
+    # unless tracking a specific issue (each turn ≈ 10-50 KB).
+    CHAT_TRACE_ENABLED: bool = False
+    CHAT_TRACE_DIR: str = str(_SERVICE_ROOT / "artifacts" / "chat_traces")
+
+    # Forecast (ML model artifacts produced by scripts/financial_training)
     CHAT_FORECAST_ENABLED: bool = True
     CHAT_FORECAST_REPORT_TABLE_CSV: str = str(
         _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "report_table.csv"
@@ -84,26 +99,6 @@ class Settings(BaseSettings):
     )
     CHAT_FORECAST_ON_DEMAND_TIMEOUT_SECONDS: int = 180
     CHAT_FORECAST_TOP_FACTORS: int = 5
-
-    @property
-    def DEEPSEEK_MODEL(self) -> str:
-        return "deepseek-reasoner" if self.DEEPSEEK_USE_REASONER else "deepseek-chat"
-
-    @property
-    def DEEPSEEK_ENABLE_THINKING(self) -> bool:
-        return self.DEEPSEEK_USE_REASONER
-
-    @property
-    def CHAT_DEEPSEEK_INPUT_PRICE_PER_1M(self) -> float:
-        return 0.55 if self.DEEPSEEK_USE_REASONER else 0.10
-
-    @property
-    def CHAT_DEEPSEEK_OUTPUT_PRICE_PER_1M(self) -> float:
-        return 2.19 if self.DEEPSEEK_USE_REASONER else 0.40
-
-    @property
-    def effective_llm_timeout(self) -> int:
-        return max(self.LLM_TIMEOUT_SECONDS, 120) if self.DEEPSEEK_USE_REASONER else self.LLM_TIMEOUT_SECONDS
 
 
 settings = Settings()

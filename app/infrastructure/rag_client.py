@@ -27,6 +27,13 @@ class RagRetrievalService:
         self.keyword_topk = max(1, int(settings.CHAT_RAG_TOPK_KEYWORD))
         self.final_topk = max(1, int(settings.CHAT_RAG_TOPK_FINAL))
         self._qdrant_client: Any = None
+        self._retrieve_traces: list[dict[str, Any]] = []
+
+    def pop_retrieve_traces(self) -> list[dict[str, Any]]:
+        """Return accumulated RAG debug traces for the current request and clear."""
+        traces = self._retrieve_traces
+        self._retrieve_traces = []
+        return traces
 
     def _get_qdrant_client(self) -> Any:
         """Lazy-init and cache QdrantClient across queries."""
@@ -73,13 +80,22 @@ class RagRetrievalService:
         if isinstance(keyword_hits_raw, BaseException):
             logger.warning("Keyword search failed: %s", keyword_hits_raw)
 
-        merged = self._merge_rrf(vector_hits, keyword_hits, limit=max(self.final_topk * 2, 8))
+        # Pull a wider candidate pool when reranking is on, so the cross-encoder
+        # has enough signal to surface the truly best chunks.
+        rerank_enabled = bool(settings.CHAT_RAG_RERANK_ENABLED)
+        candidate_limit = (
+            max(int(settings.CHAT_RAG_RERANK_CANDIDATES), self.final_topk)
+            if rerank_enabled
+            else max(self.final_topk * 2, 8)
+        )
+
+        merged = self._merge_rrf(vector_hits, keyword_hits, limit=candidate_limit)
         if not merged:
             return []
 
         details = await asyncio.to_thread(self._load_chunk_details, [row["chunk_id"] for row in merged])
 
-        output: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
         for row in merged:
             chunk_id = row["chunk_id"]
             detail = details.get(chunk_id, {})
@@ -93,7 +109,7 @@ class RagRetrievalService:
                 or "Annual report chunk"
             )
             page_number = payload.get("page_start")
-            output.append(
+            candidates.append(
                 {
                     "chunk_id": chunk_id,
                     "source_title": str(source_title),
@@ -103,7 +119,100 @@ class RagRetrievalService:
                 }
             )
 
-        return output[: self.final_topk]
+        trace_enabled = bool(settings.CHAT_TRACE_ENABLED)
+
+        if rerank_enabled and len(candidates) > 1:
+            reranked = await self._rerank(query, candidates)
+            if reranked is not None:
+                final = reranked[: self.final_topk]
+                if trace_enabled:
+                    self._retrieve_traces.append({
+                        "query": query,
+                        "pre_rerank": _snapshot(candidates),
+                        "post_rerank": _snapshot(final, score_key="rerank_score"),
+                    })
+                return final
+            logger.info("Rerank fallback to RRF order")
+
+        final = candidates[: self.final_topk]
+        if trace_enabled:
+            self._retrieve_traces.append({
+                "query": query,
+                "pre_rerank": _snapshot(final),
+                "post_rerank": None,
+            })
+        return final
+
+    async def _rerank(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Score (query, chunk) pairs with a cross-encoder. Returns reordered
+        candidates with the rerank score merged in, or None on failure."""
+        endpoint = (settings.CHAT_RAG_RERANK_URL or "").strip()
+        if not endpoint:
+            return None
+
+        documents = [c.get("text") or "" for c in candidates]
+        payload = {
+            "query": query,
+            "documents": documents,
+            "model": settings.CHAT_RAG_RERANK_MODEL,
+            "top_n": self.final_topk,
+        }
+        timeout = httpx.Timeout(max(2, int(settings.CHAT_RAG_RERANK_TIMEOUT_SECONDS)))
+
+        try:
+            client = get_http_client()
+            response = await client.post(endpoint, json=payload, timeout=timeout)
+            response.raise_for_status()
+            body = response.json()
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Rerank HTTP %s from %s: %s",
+                exc.response.status_code, endpoint, exc.response.text[:300],
+            )
+            return None
+        except httpx.ConnectError as exc:
+            logger.warning(
+                "Rerank connection refused at %s — server not running? (%s)",
+                endpoint, exc,
+            )
+            return None
+        except httpx.TimeoutException:
+            logger.warning("Rerank timeout (%ds) at %s", timeout.read, endpoint)
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Rerank failed: %s: %s (endpoint=%s)",
+                type(exc).__name__, exc, endpoint,
+            )
+            return None
+
+        results = body.get("results") if isinstance(body, dict) else None
+        if not isinstance(results, list) or not results:
+            logger.warning(
+                "Rerank returned empty/invalid body: keys=%s",
+                list(body.keys()) if isinstance(body, dict) else type(body).__name__,
+            )
+            return None
+
+        reordered: list[dict[str, Any]] = []
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            idx = entry.get("index")
+            score = entry.get("relevance_score")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
+                continue
+            chunk = dict(candidates[idx])
+            try:
+                chunk["rerank_score"] = float(score)
+            except (TypeError, ValueError):
+                pass
+            reordered.append(chunk)
+        return reordered or None
 
     async def _vector_search(self, query: str, ticker: str | None, years: list[int]) -> list[dict[str, Any]]:
         if not (self.qdrant_url and self.qdrant_collection):
@@ -338,3 +447,19 @@ class RagRetrievalService:
             out.append(y)
         out.sort()
         return out[:6]
+
+
+def _snapshot(candidates: list[dict[str, Any]], score_key: str = "score") -> list[dict[str, Any]]:
+    """Compact summary of each candidate for trace — no full text."""
+    out = []
+    for i, c in enumerate(candidates):
+        score = c.get(score_key) if c.get(score_key) is not None else c.get("score")
+        out.append({
+            "rank": i + 1,
+            "chunk_id": c.get("chunk_id"),
+            "source_title": (c.get("source_title") or "")[:80],
+            "page_number": c.get("page_number"),
+            "rrf_score": c.get("score"),
+            "rerank_score": c.get("rerank_score"),
+        })
+    return out

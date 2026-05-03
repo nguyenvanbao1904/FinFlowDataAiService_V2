@@ -88,8 +88,36 @@ def feature_label_vi(feature_name: str) -> str:
     return "một số chỉ tiêu tài chính nội tại khác"
 
 
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"   # symbols & pictographs
+    "\U0001F600-\U0001F64F"   # emoticons
+    "\U0001F680-\U0001F6FF"   # transport & map symbols
+    "\U0001F700-\U0001F77F"   # alchemical
+    "\U0001F780-\U0001F7FF"   # geometric extended
+    "\U0001F800-\U0001F8FF"   # supplemental arrows
+    "\U0001F900-\U0001F9FF"   # supplemental symbols & pictographs
+    "\U0001FA00-\U0001FA6F"   # chess symbols
+    "\U0001FA70-\U0001FAFF"   # symbols & pictographs extended-A
+    "\U00002600-\U000026FF"   # miscellaneous symbols (☀, ☁, ★, ✓, ⚠ ...)
+    "\U00002700-\U000027BF"   # dingbats (✅, ✨, ✔, ✖ ...)
+    "\U0001F1E6-\U0001F1FF"   # regional indicators (flags)
+    "]+",
+    flags=re.UNICODE,
+)
+
+
 def sanitize_user_facing_message(text: str) -> str:
-    """Clean technical leaks from LLM response while preserving markdown formatting."""
+    """Clean LLM output for the iOS chat UI (rendered by MarkdownUI).
+
+    Rules:
+    - Strip emoji and pictographic icons (CFO tone, no childish ornaments).
+    - Drop blockquotes (system prompt forbids them).
+    - Replace internal feature names (snake_case) with Vietnamese labels.
+    - Soften technical causal phrases.
+    - PRESERVE markdown structure (tables, headings, bold, bullets, separators)
+      — MarkdownUI on iOS renders it.
+    """
     if not text:
         return text
 
@@ -102,7 +130,6 @@ def sanitize_user_facing_message(text: str) -> str:
 
     cleaned = re.sub(r"\b[a-zA-Z]+(?:_[a-zA-Z0-9]+)+\b", _repl_snake, text)
 
-    # Rewrite technical causal phrases into investor-friendly language.
     replacements = [
         (r"\btác động ngược chiều\b", "tạo áp lực lên"),
         (r"\btác động cùng chiều\b", "hỗ trợ"),
@@ -113,18 +140,19 @@ def sanitize_user_facing_message(text: str) -> str:
     for pattern, repl in replacements:
         cleaned = re.sub(pattern, repl, cleaned, flags=re.IGNORECASE)
 
-    # Remove markdown bold (**text**), italic (*text*), and combinations.
-    # Must be done in order: bold first (** before *).
-    cleaned = re.sub(r'\*\*(.+?)\*\*', r'\1', cleaned)
-    cleaned = re.sub(r'\*(.+?)\*', r'\1', cleaned)
-    cleaned = re.sub(r'__(.+?)__', r'\1', cleaned)
-    cleaned = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', cleaned)
-
-    # Remove markdown headers (# Text -> Text)
-    cleaned = re.sub(r'^#{1,6}\s+', '', cleaned, flags=re.MULTILINE)
+    # Strip emoji + pictographic icons.
+    cleaned = _EMOJI_RE.sub("", cleaned)
+    cleaned = cleaned.replace("️", "").replace("‍", "")
+    # Drop blockquote markers — agent prompt forbids them.
+    cleaned = re.sub(r"^[ \t]*>+\s?", "", cleaned, flags=re.MULTILINE)
 
     # Remove orphan references to generic labels in parens.
     cleaned = re.sub(r"\(\s*một số chỉ tiêu tài chính\s*\)", "", cleaned)
-    # Collapse multiple spaces but preserve markdown line breaks.
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    # Tidy whitespace: drop emoji-induced leading spaces and trailing spaces,
+    # but KEEP the rest of the markdown structure intact.
+    cleaned = re.sub(r"^[ \t]+(?=\S)", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"[ \t]+$", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+

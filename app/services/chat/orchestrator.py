@@ -1,34 +1,35 @@
-"""ReAct chat orchestrator — single-loop agent with native tool calling.
+"""ReAct chat orchestrator powered by pydantic-ai.
 
-Replaces the 4-stage pipeline (Planner → Executor → NumericFactsExtractor → Synthesizer)
-with a single ReAct agent loop where the LLM directly calls tools and
-generates the final response.
-
-Architecture:
-    User → [System Prompt + History + User Message]
-         → LLM decides: call tools? or answer?
-         → If tools: execute → feed results back → LLM decides again
-         → If answer: return to user
-
-Benefits:
-    - 1 LLM call path (vs 2 before), iterating until done
-    - LLM sees raw tool data — no lossy NumericFactsExtractor middleman
-    - No schema sync problem — tool_registry.py is single source of truth
-    - LLM self-heals: if data is missing, it calls more tools or estimates
+The agent loop, tool routing, message-building and validation are handled
+by pydantic-ai. This file only:
+- Builds AppDeps per request
+- Runs the agent
+- Maps pydantic-ai's message log into the wire response shape consumed by
+  Spring Boot (assistant_message, tool_calls, tool_results, citations,
+  context_update).
 """
 from __future__ import annotations
 
-import asyncio
-import datetime
 import json
 import logging
-from datetime import timedelta, timezone
+import time
 from typing import Any
 
-import httpx
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
+from pydantic_ai.usage import UsageLimits
 
 from app.core.config import settings
-from app.core.http_client import get_http_client
+from app.infrastructure.llm_agent import estimate_cost, get_deepseek_model
+from app.infrastructure.market_data_client import MarketDataToolClient
+from app.infrastructure.rag_client import RagRetrievalService
 from app.models.chat import (
     ChatCitation,
     ChatOrchestrateRequest,
@@ -36,724 +37,355 @@ from app.models.chat import (
     ThreadSummaryRequest,
     ThreadSummaryResponse,
 )
-from app.infrastructure.llm_client import LLMClient, LLMToolResponse, ToolCallInfo, _accumulate_usage
-from app.services.chat.prompts.agent_prompt import AGENT_SYSTEM_PROMPT
-from app.services.chat.tool_registry import (
-    LOCAL_TOOL_NAME,
-    MARKET_DATA_TOOLS,
-    PERSONAL_FINANCE_TOOL_NAMES,
-    RAG_TOOL_NAME,
-    TOOL_DEFINITIONS,
-)
-from app.services.chat.tracing import RequestTrace
-from app.services.chat.utils.vietnamese_text import sanitize_user_facing_message
-from app.services.chat.valuation_engine import compute_fair_value
-from app.infrastructure.market_data_client import MarketDataToolClient
-from app.infrastructure.rag_client import RagRetrievalService
+from app.services.chat.agent_tools import AppDeps, build_chat_agent
+from app.services.chat.trace_writer import ChatTraceWriter
+from app.services.chat.utils.json_io import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
-# Safety valve — prevent infinite tool-calling loops.
-MAX_AGENT_ITERATIONS = 6
+_RAG_TOOL_NAME = "search_annual_reports"
+_HISTORY_LIMIT = 8
+_CONTEXT_SUMMARY_MAX = 2000
 
-# Max characters per tool result to prevent context overflow.
-MAX_TOOL_RESULT_CHARS = 6000
+# Hard caps per chat turn — protects against runaway tool loops and
+# adversarial cost burn. Tuned for: ReAct loop ≤ 8 LLM calls, ≤ 12 tool
+# calls (1 compute_fair_value can fan out to 5 backend reads internally).
+_USAGE_LIMITS = UsageLimits(request_limit=8, tool_calls_limit=12)
 
 
 class ChatOrchestrator:
-    """ReAct agent orchestrator — single LLM loop with tool calling."""
+    """Thin wrapper around a pydantic-ai Agent."""
 
     def __init__(self) -> None:
-        self._llm = LLMClient()
-        self._tool_client = MarketDataToolClient()
+        self._agent = build_chat_agent()
+        self._market_client = MarketDataToolClient()
         self._rag_service = RagRetrievalService()
-        self._debug_log = bool(settings.CHAT_DEBUG_LOG_PROMPTS)
-
-        # Filter out RAG tool if RAG is disabled.
-        if bool(settings.CHAT_RAG_ENABLED):
-            self._tool_defs = TOOL_DEFINITIONS
-        else:
-            self._tool_defs = [
-                t for t in TOOL_DEFINITIONS
-                if t["function"]["name"] != RAG_TOOL_NAME
-            ]
+        self._trace = ChatTraceWriter()
 
     async def orchestrate(self, request: ChatOrchestrateRequest) -> ChatOrchestrateResponse:
-        """Run the ReAct agent loop."""
-        trace = RequestTrace()
-
-        # Build initial messages.
-        messages = self._build_messages(request)
-
-        all_tool_calls: list[dict[str, Any]] = []
-        all_tool_results: list[dict[str, Any]] = []
-        rag_chunks: list[dict[str, Any]] = []
-        accumulated_usage: dict[str, int] = {
-            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-        }
-        final_content = ""
-
-        # ── ReAct loop ────────────────────────────────────────────────
-        for iteration in range(MAX_AGENT_ITERATIONS):
-            with trace.step(f"agent_turn_{iteration}") as step:
-                response: LLMToolResponse = await self._llm.call_with_tools(
-                    messages=messages,
-                    tools=self._tool_defs,
-                    stage=f"agent_turn_{iteration}",
-                )
-                _accumulate_usage(accumulated_usage, response.usage)
-                step.tokens = response.usage.get("total_tokens", 0)
-
-            if response.tool_calls:
-                # ── LLM wants to call tools ───────────────────────────
-                # Append assistant message with tool_calls to conversation.
-                messages.append({
-                    "role": "assistant",
-                    "content": response.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(
-                                    tc.arguments, ensure_ascii=False,
-                                ),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ],
-                })
-
-                # Execute all tool calls in parallel.
-                with trace.step(f"tools_{iteration}") as step:
-                    results = await self._execute_tool_calls(response.tool_calls)
-                    step.metadata = {
-                        "tools": [tc.name for tc in response.tool_calls],
-                        "ok": sum(1 for r in results if r.get("ok")),
-                    }
-
-                # Feed results back into the conversation.
-                for tc, result in zip(response.tool_calls, results):
-                    all_tool_calls.append({
-                        "name": tc.name, "arguments": tc.arguments,
-                    })
-                    all_tool_results.append(result)
-
-                    # Track RAG chunks for citations.
-                    if tc.name == RAG_TOOL_NAME and result.get("ok"):
-                        for chunk in (result.get("data") or []):
-                            if isinstance(chunk, dict):
-                                rag_chunks.append(chunk)
-
-                    # Serialize tool result for LLM context.
-                    result_data = result.get("data")
-                    if not result.get("ok"):
-                        result_data = {
-                            "error": result.get("error_message", "unknown error"),
-                        }
-                    result_content = json.dumps(
-                        result_data, ensure_ascii=False, default=str,
-                    )
-                    if len(result_content) > MAX_TOOL_RESULT_CHARS:
-                        result_content = (
-                            result_content[:MAX_TOOL_RESULT_CHARS]
-                            + "...[truncated]"
-                        )
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result_content,
-                    })
-            else:
-                # ── LLM returned final answer ─────────────────────────
-                final_content = response.content or ""
-                break
-        else:
-            # Max iterations exhausted.
-            if not final_content:
-                final_content = (
-                    "Xin lỗi, tôi cần thêm thời gian để phân tích. "
-                    "Bạn có thể hỏi lại được không?"
-                )
-
-        # ── Build response ────────────────────────────────────────────
-        assistant_message = sanitize_user_facing_message(final_content.strip())
-        if not assistant_message:
-            assistant_message = "Xin lỗi, tôi chưa thể trả lời lúc này."
-
-        ticker, year = self._extract_context(all_tool_calls)
-        citations = self._pick_citations(rag_chunks)
-        needs_clarification = self._detect_clarification(assistant_message)
-
-        cost_usd = self._llm.estimate_cost(
-            accumulated_usage["input_tokens"],
-            accumulated_usage["output_tokens"],
+        deps = AppDeps(
+            user_id=request.user_id,
+            market_client=self._market_client,
+            rag_service=self._rag_service,
         )
 
+        trace = self._trace.enabled
+        if trace:
+            history_len = len(request.last_messages or [])
+            logger.info(
+                "[TRACE] ▶ thread=%s user=%s | msg=%r | history=%d",
+                request.thread_id[:12], request.user_id[:8],
+                request.user_message[:80], history_len,
+            )
+
+        t0 = time.perf_counter()
+        try:
+            result = await self._agent.run(
+                request.user_message,
+                message_history=_build_history(request),
+                deps=deps,
+                usage_limits=_USAGE_LIMITS,
+            )
+        except Exception as exc:
+            logger.exception("Agent run failed")
+            err_response = _error_response(exc, latency_ms=_elapsed_ms(t0))
+            if self._trace.enabled:
+                self._trace.write(
+                    request=request, response=err_response,
+                    all_messages_json=None,
+                    latency_ms=_elapsed_ms(t0), error=exc,
+                )
+            return err_response
+
+        latency_ms = _elapsed_ms(t0)
+        tool_calls, tool_results, rag_chunks = _extract_tool_io(result)
+
+        if trace:
+            _log_tool_io(tool_calls, tool_results)
+        usage = result.usage()
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+
+        # Sanitization happens inside the agent via @agent.output_validator.
+        message = (result.output or "").strip() or "Xin lỗi, tôi chưa thể trả lời lúc này."
+        ticker, year = _extract_context(tool_calls)
         context_update: dict[str, Any] = {}
         if ticker:
             context_update["last_ticker"] = ticker
         if year:
             context_update["last_year"] = year
 
-        trace.log_summary()
+        # Prefer the actual model name reported by the API (e.g. "deepseek-v4-flash")
+        # over the config alias ("deepseek-chat") for accurate logging/billing.
+        model_id = _actual_model_name(result) or (
+            self._agent.model.model_name if self._agent.model else settings.DEEPSEEK_MODEL
+        )
+        provider = model_id.split("-")[0]
 
-        return ChatOrchestrateResponse(
-            assistant_message=assistant_message,
-            needs_clarification=needs_clarification,
-            clarification_question=(
-                assistant_message if needs_clarification else None
-            ),
-            provider=self._llm.model.split("-")[0] if self._llm.model else "deepseek",
-            model=self._llm.model,
-            input_tokens=accumulated_usage["input_tokens"],
-            output_tokens=accumulated_usage["output_tokens"],
-            total_tokens=accumulated_usage["total_tokens"],
-            cost_usd=cost_usd,
-            latency_ms=trace.total_ms,
-            tool_calls=all_tool_calls,
-            tool_results=all_tool_results,
-            citations=[ChatCitation(**c) for c in citations],
+        response = ChatOrchestrateResponse(
+            assistant_message=message,
+            needs_clarification=_needs_clarification(message),
+            clarification_question=message if _needs_clarification(message) else None,
+            provider=provider,
+            model=model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            cost_usd=estimate_cost(input_tokens, output_tokens),
+            latency_ms=latency_ms,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+            citations=[ChatCitation(**c) for c in _pick_citations(rag_chunks)],
             context_update=context_update,
         )
 
-    # ── Message building ──────────────────────────────────────────────
-
-    @staticmethod
-    def _build_messages(
-        request: ChatOrchestrateRequest,
-    ) -> list[dict[str, Any]]:
-        """Build the initial message array for the agent."""
-        system_content = AGENT_SYSTEM_PROMPT
-
-        vn_tz = timezone(timedelta(hours=7))
-        now_vn = datetime.datetime.now(vn_tz)
-        system_content += (
-            f"\n\n--- THÔNG TIN NGỮ CẢNH HỆ THỐNG ---\n"
-            f"Thời gian hiện tại: {now_vn.strftime('%Y-%m-%dT%H:%M:%S.%f%z')} "
-            f"({now_vn.strftime('%A, %d/%m/%Y')})\n"
-            f"USER_ID của người dùng hiện tại: {request.user_id}\n"
-            f"LUÔN TUÂN THỦ NGÀY GIỜ NÀY. Nếu user hỏi 'hôm qua', hãy lùi 1 ngày so với ngày hiện tại này."
-        )
-        if request.context_summary and request.context_summary.strip():
-            summary = request.context_summary.strip()[:2000]
-            system_content += (
-                f"\n\nContext từ cuộc hội thoại trước: "
-                f"{summary}"
+        if self._trace.enabled:
+            logger.info(
+                "[TRACE] ◀ %dms | tokens=%d+%d | tools=%d | answer=%r",
+                latency_ms, response.input_tokens, response.output_tokens,
+                len(tool_calls), (response.assistant_message or "")[:120],
+            )
+            try:
+                messages_json = result.all_messages_json()
+            except Exception:
+                messages_json = None
+            self._trace.write(
+                request=request, response=response,
+                all_messages_json=messages_json,
+                latency_ms=latency_ms,
+                rag_traces=self._rag_service.pop_retrieve_traces(),
             )
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_content},
-        ]
+        return response
 
-        # Add recent chat history (only user/assistant turns).
-        for msg in request.last_messages[-8:]:
-            if msg.role in ("user", "assistant"):
-                messages.append({
-                    "role": msg.role,
-                    "content": msg.content,
+    async def summarize_thread(self, request: ThreadSummaryRequest) -> ThreadSummaryResponse:
+        return await summarize_thread(request, self._agent.model.model_name if self._agent.model else settings.DEEPSEEK_MODEL)
+
+
+# ── Pure helpers (module-level so they're easy to test) ─────────────
+
+
+def _build_history(request: ChatOrchestrateRequest) -> list[ModelRequest | ModelResponse]:
+    history: list[ModelRequest | ModelResponse] = []
+    if request.context_summary and request.context_summary.strip():
+        summary = request.context_summary.strip()[:_CONTEXT_SUMMARY_MAX]
+        history.append(ModelRequest(parts=[
+            UserPromptPart(content=f"Context từ cuộc hội thoại trước: {summary}")
+        ]))
+    current = request.user_message.strip()
+    for msg in request.last_messages[-_HISTORY_LIMIT:]:
+        # Backend includes the current message in last_messages; skip it to
+        # avoid sending the same user turn twice (pydantic-ai appends it again).
+        if msg.role == "user" and msg.content.strip() == current:
+            continue
+        if msg.role == "user":
+            history.append(ModelRequest(parts=[UserPromptPart(content=msg.content)]))
+        elif msg.role == "assistant":
+            history.append(ModelResponse(parts=[TextPart(content=msg.content)]))
+    return history
+
+
+def _extract_tool_io(result: Any) -> tuple[list[dict], list[dict], list[dict]]:
+    """Walk the message log → (tool_calls, tool_results, rag_chunks)."""
+    tool_calls: list[dict] = []
+    tool_results: list[dict] = []
+    rag_chunks: list[dict] = []
+
+    for msg in result.all_messages():
+        for part in getattr(msg, "parts", []):
+            if isinstance(part, ToolCallPart):
+                args = part.args
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                tool_calls.append({"name": part.tool_name, "arguments": args or {}})
+            elif isinstance(part, ToolReturnPart):
+                parsed = parse_llm_json(part.content) if isinstance(part.content, str) else part.content
+                tool_results.append({
+                    "name": part.tool_name,
+                    "ok": True,
+                    "data": parsed,
+                    "error_code": None,
+                    "error_message": None,
+                    "source_refs": [],
+                })
+                if part.tool_name == _RAG_TOOL_NAME and isinstance(parsed, list):
+                    rag_chunks.extend(c for c in parsed if isinstance(c, dict))
+            elif isinstance(part, RetryPromptPart):
+                content = part.content if isinstance(part.content, str) else str(part.content)
+                tool_results.append({
+                    "name": part.tool_name or "unknown",
+                    "ok": False,
+                    "data": None,
+                    "error_code": "TOOL_ERROR",
+                    "error_message": content[:300],
+                    "source_refs": [],
                 })
 
-        # Add current user message.
-        messages.append({
-            "role": "user",
-            "content": request.user_message,
-        })
+    return tool_calls, tool_results, rag_chunks
 
-        return messages
 
-    # ── Tool execution ────────────────────────────────────────────────
+def _extract_context(tool_calls: list[dict[str, Any]]) -> tuple[str | None, int | None]:
+    tickers: set[str] = set()
+    years: list[int] = []
+    for call in tool_calls:
+        args = call.get("arguments") or {}
+        symbol = args.get("symbol") or args.get("ticker")
+        if isinstance(symbol, str) and symbol.strip():
+            tickers.add(symbol.strip().upper())
+        target_year = args.get("targetYear")
+        if isinstance(target_year, int):
+            years.append(target_year)
+    return (
+        ",".join(sorted(tickers)) if tickers else None,
+        max(years) if years else None,
+    )
 
-    async def _execute_tool_calls(
-        self,
-        tool_calls: list[ToolCallInfo],
-    ) -> list[dict[str, Any]]:
-        """Execute tool calls in parallel, routing to the appropriate service."""
 
-        async def _unknown_tool(name: str) -> dict[str, Any]:
-            return {
-                "name": name, "ok": False, "data": None,
-                "error_code": "UNKNOWN_TOOL",
-                "error_message": f"Tool '{name}' is not registered",
-                "source_refs": [],
-            }
+def _needs_clarification(message: str) -> bool:
+    """Detect when the agent is BLOCKED waiting for user input.
 
-        tasks: list[Any] = []
-        for tc in tool_calls:
-            if tc.name == RAG_TOOL_NAME:
-                tasks.append(self._execute_rag_tool(tc))
-            elif tc.name == LOCAL_TOOL_NAME:
-                tasks.append(self._execute_local_tool(tc))
-            elif tc.name in PERSONAL_FINANCE_TOOL_NAMES:
-                tasks.append(self._execute_personal_finance_tool(tc))
-            elif tc.name in MARKET_DATA_TOOLS:
-                tasks.append(
-                    self._tool_client.execute_tool_call(tc.name, tc.arguments)
-                )
-            else:
-                tasks.append(_unknown_tool(tc.name))
+    A long answer that happens to end with a polite "Bạn có muốn xem thêm...?"
+    is NOT a clarification — the agent already delivered value. Clarification
+    means the agent could not proceed without more info.
+    """
+    s = message.strip()
+    # Long answers (>240 chars) are deliveries, not clarifications, even if
+    # they end with a follow-up question.
+    if len(s) > 240:
+        return False
+    lower = s.lower()
+    blocking_patterns = (
+        "vui lòng cho tôi biết",
+        "mã cổ phiếu nào",
+        "bạn đang hỏi về mã",
+        "bạn muốn hỏi về",
+        "cho tôi biết mã",
+        "chưa rõ mã cổ phiếu",
+    )
+    if any(p in lower for p in blocking_patterns):
+        return True
+    # Short message ending with a question and no concrete content yet.
+    if s.endswith("?") and len(s) < 160:
+        return True
+    return False
 
-        return list(await asyncio.gather(*tasks))
 
-    async def _execute_rag_tool(
-        self,
-        tc: ToolCallInfo,
-    ) -> dict[str, Any]:
-        """Execute RAG retrieval as a tool call."""
-        ticker = (tc.arguments.get("ticker") or "").strip().upper()
-        query = (tc.arguments.get("query") or "").strip()
-
-        if not ticker or not query:
-            return {
-                "name": RAG_TOOL_NAME, "ok": False, "data": None,
-                "error_code": "INVALID_ARGS",
-                "error_message": "ticker and query are required",
-                "source_refs": [],
-            }
-
-        try:
-            chunks = await self._rag_service.retrieve(
-                query=query, ticker=ticker, years=None,
-            )
-            # Truncate chunks for token efficiency.
-            compact = [
-                {
-                    "chunk_id": c.get("chunk_id"),
-                    "source_title": c.get("source_title"),
-                    "page_number": c.get("page_number"),
-                    "text": (c.get("text") or "")[:1200],
-                }
-                for c in (chunks or [])[:6]
-            ]
-            return {
-                "name": RAG_TOOL_NAME, "ok": True, "data": compact,
-                "error_code": None, "error_message": None,
-                "source_refs": [],
-            }
-        except Exception as exc:
-            logger.exception("RAG retrieval failed: %s", exc)
-            return {
-                "name": RAG_TOOL_NAME, "ok": False, "data": None,
-                "error_code": "RAG_ERROR",
-                "error_message": str(exc)[:200],
-                "source_refs": [],
-            }
-
-    async def _execute_local_tool(
-        self,
-        tc: ToolCallInfo,
-    ) -> dict[str, Any]:
-        """Execute compute_fair_value: self-fetch data + deterministic computation."""
-        try:
-            symbol = (tc.arguments.get("symbol") or "").strip().upper()
-            if not symbol:
-                return {
-                    "name": tc.name, "ok": False, "data": None,
-                    "error_code": "INVALID_ARGS",
-                    "error_message": "symbol is required",
-                    "source_refs": [],
-                }
-
-            target_year = tc.arguments.get("target_year")
-
-            # Step 1: Fetch all data from backend in parallel.
-            inputs = await self._fetch_valuation_inputs(symbol, target_year)
-            if "error" in inputs and len(inputs) == 1:
-                return {
-                    "name": tc.name, "ok": False, "data": inputs,
-                    "error_code": "DATA_ERROR",
-                    "error_message": inputs["error"],
-                    "source_refs": [],
-                }
-
-            # Step 2: Deterministic computation (pure Python, no I/O).
-            result_data = compute_fair_value(inputs)
-
-            is_error = "error" in result_data and len(result_data) == 1
-            return {
-                "name": tc.name,
-                "ok": not is_error,
-                "data": result_data,
-                "error_code": "COMPUTE_ERROR" if is_error else None,
-                "error_message": result_data.get("error") if is_error else None,
-                "source_refs": [],
-            }
-        except Exception as exc:
-            logger.exception("Local tool '%s' failed: %s", tc.name, exc)
-            return {
-                "name": tc.name, "ok": False, "data": None,
-                "error_code": "LOCAL_TOOL_ERROR",
-                "error_message": str(exc)[:200],
-                "source_refs": [],
-            }
-    async def _execute_personal_finance_tool(
-        self,
-        tc: ToolCallInfo,
-    ) -> dict[str, Any]:
-        """Execute personal finance tools: call Spring Boot internal API."""
-        user_id = (tc.arguments.get("user_id") or "").strip()
-        if not user_id:
-            return {
-                "name": tc.name, "ok": False, "data": None,
-                "error_code": "INVALID_ARGS",
-                "error_message": "user_id is required",
-                "source_refs": [],
-            }
-
-        try:
-            base_url = settings.JAVA_BACKEND_URL.rstrip("/")
-            internal_key = settings.INTERNAL_API_KEY.strip()
-
-            headers: dict[str, str] = {}
-            if internal_key:
-                headers["X-Internal-Api-Key"] = internal_key
-
-            timeout = httpx.Timeout(max(5, int(settings.CHAT_TOOL_TIMEOUT_SECONDS)))
-            client = get_http_client()
-
-            if tc.name == "get_personal_finance_report":
-                response = await client.get(
-                    f"{base_url}/transaction/finance-report",
-                    params={"userId": user_id},
-                    headers=headers,
-                    timeout=timeout,
-                )
-            elif tc.name == "get_user_transaction_context":
-                response = await client.get(
-                    f"{base_url}/transaction/user-context",
-                    params={"userId": user_id},
-                    headers=headers,
-                    timeout=timeout,
-                )
-            elif tc.name == "add_transaction":
-                body = {
-                    "amount": tc.arguments.get("amount"),
-                    "type": tc.arguments.get("type"),
-                    "categoryId": tc.arguments.get("categoryId"),
-                    "accountId": tc.arguments.get("accountId"),
-                    "note": tc.arguments.get("note", ""),
-                    "transactionDate": tc.arguments.get("transactionDate"),
-                }
-                response = await client.post(
-                    f"{base_url}/transaction/add-transaction",
-                    params={"userId": user_id},
-                    headers=headers,
-                    json=body,
-                    timeout=timeout,
-                )
-            elif tc.name == "get_user_budgets":
-                response = await client.get(
-                    f"{base_url}/budget/budgets",
-                    params={"userId": user_id},
-                    headers=headers,
-                    timeout=timeout,
-                )
-            elif tc.name == "add_budget":
-                body: dict[str, Any] = {
-                    "categoryId": tc.arguments.get("categoryId"),
-                    "targetAmount": tc.arguments.get("targetAmount"),
-                    "startDate": tc.arguments.get("startDate"),
-                    "endDate": tc.arguments.get("endDate"),
-                }
-                if "isRecurring" in tc.arguments and tc.arguments["isRecurring"] is not None:
-                    body["isRecurring"] = tc.arguments.get("isRecurring")
-                rsd = tc.arguments.get("recurringStartDate")
-                if isinstance(rsd, str) and rsd.strip():
-                    body["recurringStartDate"] = rsd.strip()
-                response = await client.post(
-                    f"{base_url}/budget/create-budget",
-                    params={"userId": user_id},
-                    headers=headers,
-                    json=body,
-                    timeout=timeout,
-                )
-            else:
-                return {
-                    "name": tc.name, "ok": False, "data": None,
-                    "error_code": "UNKNOWN_PF_TOOL",
-                    "error_message": f"Unknown personal finance tool: {tc.name}",
-                    "source_refs": [],
-                }
-
-            if response.status_code < 200 or response.status_code >= 300:
-                return {
-                    "name": tc.name, "ok": False, "data": None,
-                    "error_code": f"HTTP_{response.status_code}",
-                    "error_message": response.text[:300],
-                    "source_refs": [],
-                }
-
-            data = response.json()
-            return {
-                "name": tc.name, "ok": True, "data": data,
-                "error_code": None, "error_message": None,
-                "source_refs": [],
-            }
-        except Exception as exc:
-            logger.exception("Personal finance tool '%s' failed: %s", tc.name, exc)
-            return {
-                "name": tc.name, "ok": False, "data": None,
-                "error_code": "PERSONAL_FINANCE_ERROR",
-                "error_message": str(exc)[:200],
-                "source_refs": [],
-            }
-
-    async def _fetch_valuation_inputs(
-        self,
-        symbol: str,
-        target_year: int | None = None,
-    ) -> dict[str, Any]:
-        """Fetch all data needed for valuation from backend in parallel.
-
-        Returns a dict ready to be passed to compute_fair_value().
-        """
-        today = datetime.date.today()
-        five_years_ago = today.replace(year=today.year - 5)
-        yr = target_year or today.year
-
-        forecast_years = [yr]
-        if yr > today.year + 1:
-            forecast_years = list(range(today.year + 1, yr + 1))
-
-        # Fetch market data and forecast horizon in parallel.
-        metrics_r, financial_r, daily_val_r, live_r, *forecast_results = (
-            await asyncio.gather(
-                self._tool_client.execute_tool_call(
-                    "get_company_metrics", {"symbol": symbol},
-                ),
-                self._tool_client.execute_tool_call(
-                    "get_company_financial_series",
-                    {"symbol": symbol, "annualLimit": 6},
-                ),
-                self._tool_client.execute_tool_call(
-                    "get_company_daily_valuations",
-                    {
-                        "symbol": symbol,
-                        "startDate": five_years_ago.isoformat(),
-                        "endDate": today.isoformat(),
-                    },
-                ),
-                self._tool_client.execute_tool_call(
-                    "get_company_live_valuation_snapshot", {"symbol": symbol},
-                ),
-                *[
-                    self._tool_client.execute_tool_call(
-                        "get_company_forecast",
-                        {"symbol": symbol, "targetYear": forecast_year},
-                    )
-                    for forecast_year in forecast_years
-                ],
-            )
-        )
-
-        # Check for critical failures.
-        errors: list[str] = []
-        for label, result in [
-            ("metrics", metrics_r),
-            ("financial", financial_r),
-            ("live", live_r),
-        ]:
-            if not result.get("ok"):
-                errors.append(
-                    f"{label}: {result.get('error_message', 'unknown')}"
-                )
-        if errors:
-            return {"error": f"Không lấy được dữ liệu: {'; '.join(errors)}"}
-
-        # ── Extract fields ──
-        overview = (metrics_r.get("data") or {}).get("overview") or {}
-
-        # Profit history from financial series (annual points only, full-year = 4 quarters).
-        fin_data = financial_r.get("data") or {}
-        raw_entries = fin_data.get("nonBank") or fin_data.get("bank") or []
-        profit_history = [
-            {
-                "year": item["year"],
-                "profit_after_tax": item.get("profitAfterTax", 0),
-            }
-            for item in raw_entries
-            if isinstance(item, dict) and "year" in item
-            and (item.get("quarter") is None or item.get("quarter") == 0)
-            and item.get("quarterCount", 0) == 4
-        ]
-
-        # Daily valuations summary.
-        daily_summary = (
-            (daily_val_r.get("data") or {}).get("summary") or {}
-        )
-
-        # Live price.
-        live_data = live_r.get("data") or {}
-
-        # Forecasts are non-critical; use the horizon when available for forward valuation.
-        forecast_series = []
-        forecast_top_factors: dict = {}
-        forecast_quality: dict = {}
-        for result in forecast_results:
-            data = result.get("data") if result.get("ok") else None
-            if isinstance(data, dict):
-                forecast_series.append({
-                    "year": data.get("predict_target_year"),
-                    "revenue_pred": data.get("revenue_pred"),
-                    "profit_pred": data.get("profit_pred"),
-                    "feature_year": data.get("feature_year"),
-                })
-                if data.get("top_factors") and not forecast_top_factors:
-                    forecast_top_factors = data["top_factors"]
-                if data.get("quality") and not forecast_quality:
-                    forecast_quality = data["quality"]
-        forecast_data = next(
-            (
-                item for item in forecast_series
-                if item.get("year") == yr
-            ),
-            forecast_series[-1] if forecast_series else {},
-        )
-
-        return {
-            "eps": overview.get("eps", 0),
-            "bvps": overview.get("bvps", 0),
-            "roe": overview.get("roe", 0),
-            "live_price": live_data.get("livePriceVnd", 0),
-            "profit_history": profit_history,
-            "industry_icb_code": overview.get("industryIcbCode"),
-            "industry_label": overview.get("industryLabel"),
-            "median_pe": overview.get("medianPE") or daily_summary.get("pe_median"),
-            "median_pb": overview.get("medianPB") or daily_summary.get("pb_median"),
-            "median_ps": overview.get("medianPS") or daily_summary.get("ps_median"),
-            "live_ps": live_data.get("livePs"),
-            "forecast_profit": forecast_data.get("profit_pred"),
-            "forecast_revenue": forecast_data.get("revenue_pred"),
-            "forecast_series": forecast_series,
-            "forecast_top_factors": forecast_top_factors,
-            "forecast_quality": forecast_quality,
-            "cplh": overview.get("cplh", 0),
-            "symbol": symbol,
-            "target_year": yr,
-            "company_name": overview.get("companyName", symbol),
+def _pick_citations(rag_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": r.get("chunk_id"),
+            "source_title": r.get("source_title"),
+            "page_number": r.get("page_number"),
+            "score": r.get("score"),
         }
+        for r in rag_chunks[:5]
+        if isinstance(r, dict)
+    ]
 
-    # ── Context extraction ────────────────────────────────────────────
 
-    @staticmethod
-    def _extract_context(
-        tool_calls: list[dict[str, Any]],
-    ) -> tuple[str | None, int | None]:
-        """Extract ticker and year from the tool calls made during the session."""
-        tickers: set[str] = set()
-        years: list[int] = []
+def _actual_model_name(result: Any) -> str | None:
+    """Extract the real model name from the last ModelResponse in the message log."""
+    name = None
+    for msg in result.all_messages():
+        model_name = getattr(msg, "model_name", None)
+        if model_name:
+            name = model_name
+    return name
 
-        for call in tool_calls:
-            args = call.get("arguments", {})
-            symbol = args.get("symbol") or args.get("ticker")
-            if isinstance(symbol, str) and symbol.strip():
-                tickers.add(symbol.strip().upper())
-            target_year = args.get("targetYear")
-            if isinstance(target_year, int):
-                years.append(target_year)
 
-        ticker = ",".join(sorted(tickers)) if tickers else None
-        year = max(years) if years else None
-        return ticker, year
-
-    @staticmethod
-    def _detect_clarification(message: str) -> bool:
-        """Heuristic: detect if the response is asking the user for clarification."""
-        stripped = message.strip()
-        if stripped.endswith("?"):
-            return True
-        patterns = [
-            "bạn muốn", "bạn có thể cho", "vui lòng cho tôi biết",
-            "mã cổ phiếu nào", "bạn đang hỏi về",
-        ]
-        lower = stripped.lower()
-        return any(p in lower for p in patterns)
-
-    @staticmethod
-    def _pick_citations(
-        rag_chunks: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Pick top citations from RAG chunks."""
-        if not rag_chunks:
-            return []
-        return [
-            {
-                "chunk_id": r.get("chunk_id"),
-                "source_title": r.get("source_title"),
-                "page_number": r.get("page_number"),
-                "score": r.get("score"),
-            }
-            for r in rag_chunks[:5]
-            if isinstance(r, dict)
-        ]
-
-    # ── Thread summary (unchanged from old architecture) ──────────────
-
-    async def summarize_thread(
-        self,
-        request: ThreadSummaryRequest,
-    ) -> ThreadSummaryResponse:
-        """Summarize chat thread context."""
-        trace = RequestTrace()
-
-        recent_messages = [
-            {
-                "role": msg.role,
-                "content": msg.content,
-                "created_at": msg.created_at,
-            }
-            for msg in request.recent_messages
-        ]
-
-        user_prompt = (
-            f"Summary cũ: {request.existing_summary or '{}'}\n"
-            f"Recent messages: {json.dumps(recent_messages, ensure_ascii=False)}"
-        )
-
-        with trace.step("thread_summary") as s:
-            summary_json, usage = await self._llm.call_json(
-                system_prompt=(
-                    "Bạn là module context summary cho chat đầu tư. "
-                    "Output ONLY JSON với keys: current_ticker,current_period,"
-                    "user_goal,facts_confirmed,open_questions,decisions. "
-                    "Nếu thiếu ticker/year thì để null. "
-                    "Danh sách fields dạng list phải ngắn gọn."
-                ),
-                user_prompt=user_prompt,
-                max_output_tokens=400,
-                stage="thread_summary",
+def _log_tool_io(tool_calls: list[dict], tool_results: list[dict]) -> None:
+    """Print each tool call + result summary to stdout when trace is enabled."""
+    for i, call in enumerate(tool_calls):
+        args_preview = json.dumps(call.get("arguments") or {}, ensure_ascii=False)[:120]
+        logger.info("[TRACE]   tool[%d] → %s(%s)", i + 1, call["name"], args_preview)
+    for i, res in enumerate(tool_results):
+        if res.get("ok"):
+            data_preview = json.dumps(res.get("data"), ensure_ascii=False, default=str)[:160]
+            logger.info("[TRACE]   result[%d] ← %s OK: %s", i + 1, res["name"], data_preview)
+        else:
+            logger.info(
+                "[TRACE]   result[%d] ← %s ERROR: %s",
+                i + 1, res.get("name", "?"), res.get("error_message", "")[:120],
             )
-            s.tokens = usage.get("total_tokens", 0)
-
-        current_ticker = summary_json.get("current_ticker")
-        current_period = summary_json.get("current_period")
-        context_summary = json.dumps(
-            summary_json, ensure_ascii=False, separators=(",", ":"),
-        )
-
-        trace.log_summary()
-
-        return ThreadSummaryResponse(
-            context_summary=context_summary,
-            current_ticker=(
-                str(current_ticker).upper()
-                if isinstance(current_ticker, str) and current_ticker.strip()
-                else None
-            ),
-            current_period=(
-                int(current_period) if isinstance(current_period, int) else None
-            ),
-            provider=self._llm.model.split("-")[0] if self._llm.model else "deepseek",
-            model=self._llm.model,
-            input_tokens=usage["input_tokens"],
-            output_tokens=usage["output_tokens"],
-            total_tokens=usage["total_tokens"],
-            cost_usd=self._llm.estimate_cost(
-                usage["input_tokens"], usage["output_tokens"],
-            ),
-            latency_ms=trace.total_ms,
-        )
 
 
+def _error_response(exc: Exception, latency_ms: int) -> ChatOrchestrateResponse:
+    return ChatOrchestrateResponse(
+        assistant_message=f"Xin lỗi, đã xảy ra lỗi: {type(exc).__name__}. Vui lòng thử lại.",
+        provider="deepseek",
+        model=settings.DEEPSEEK_MODEL,
+        latency_ms=latency_ms,
+    )
+
+
+def _elapsed_ms(t0: float) -> int:
+    return int((time.perf_counter() - t0) * 1000)
+
+
+# ── Thread summary ────────────────────────────────────────────────────
+
+
+async def summarize_thread(request: ThreadSummaryRequest, model_id: str) -> ThreadSummaryResponse:
+    """Summarize chat thread context — uses a one-shot agent."""
+    from pydantic_ai import Agent
+    from pydantic_ai.models.openai import OpenAIChatModelSettings
+
+    recent = [
+        {"role": m.role, "content": m.content, "created_at": m.created_at}
+        for m in request.recent_messages
+    ]
+    user_prompt = (
+        f"Summary cũ: {request.existing_summary or '{}'}\n"
+        f"Recent messages: {json.dumps(recent, ensure_ascii=False)}"
+    )
+
+    agent = Agent(
+        get_deepseek_model(),
+        system_prompt=(
+            "Bạn là module context summary cho chat đầu tư. "
+            "Output ONLY JSON với keys: current_ticker,current_period,"
+            "user_goal,facts_confirmed,open_questions,decisions. "
+            "Nếu thiếu ticker/year thì để null. "
+            "Danh sách fields dạng list phải ngắn gọn."
+        ),
+        model_settings=OpenAIChatModelSettings(
+            temperature=0.0,
+            max_tokens=400,
+            extra_body={"response_format": {"type": "json_object"}},
+        ),
+        output_type=str,
+    )
+
+    t0 = time.perf_counter()
+    result = await agent.run(user_prompt)
+    latency_ms = _elapsed_ms(t0)
+
+    parsed = parse_llm_json(result.output)
+    summary_json = parsed if isinstance(parsed, dict) else {}
+
+    usage = result.usage()
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+
+    current_ticker = summary_json.get("current_ticker")
+    current_period = summary_json.get("current_period")
+
+    return ThreadSummaryResponse(
+        context_summary=json.dumps(summary_json, ensure_ascii=False, separators=(",", ":")),
+        current_ticker=(
+            str(current_ticker).upper()
+            if isinstance(current_ticker, str) and current_ticker.strip()
+            else None
+        ),
+        current_period=current_period if isinstance(current_period, int) else None,
+        provider=model_id.split("-")[0],
+        model=model_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        cost_usd=estimate_cost(input_tokens, output_tokens),
+        latency_ms=latency_ms,
+    )

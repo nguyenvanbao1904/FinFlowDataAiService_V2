@@ -1,0 +1,31 @@
+{
+  "llm_request": {
+    "max_tokens_eff": 300,
+    "messages": [
+      {
+        "content": "You are a helpful financial assistant that extracts transaction details from text.\nYou must output exactly one JSON object and nothing else. Do not output markdown, code format tags, or reasoning.",
+        "role": "system"
+      },
+      {
+        "content": "TASK: Extract one finance transaction from RAW_TEXT.\nOUTPUT: Return JSON with keys: amount (float), type ('INCOME' or 'EXPENSE'), categoryId, accountId, note, transactionDate, confidence (0.0-1.0), warnings (list).\nCONSTRAINTS:\n- amount: MUST be the full integer value in VND. Apply multipliers: 'k', 'nghìn' = x 1,000; 'lít', 'xị' = x 100,000; 'củ', 'triệu' = x 1,000,000 (e.g., '30k' -> 30000, '2 xị' -> 200000).\n- transactionDate must be an ISO8601 string.\n- categoryId and accountId MUST exactly match the id from the provided lists below. Match by name or context.\n- If a required field cannot be reasonably deduced, leave it null and list the field name in missingFields.\n- **note**: Must be a concise, clean description of the transaction, extracted from RAW_TEXT BUT:\n    * Remove any amount, numeric value, currency unit (e.g., '2 xị', '200k', '30 nghìn', '10 triệu').\n    * Remove redundant verbs like 'hết', 'mất', 'tốn', 'chi', 'tiêu' if they are just indicating expense.\n    * Keep the essential action and object (e.g., 'đổ xăng', 'mua cà phê', 'rút tiền', 'nhận lương').\n    * Do NOT copy RAW_TEXT literally. Derive a meaningful short note.\n    * If the cleaned note would be empty, fallback to a generic term like 'giao dịch' or keep the first meaningful word.\nCURRENT_TIME=<MASKED>; timezone=Asia/Ho_Chi_Minh; locale=vi-VN\n\nCATEGORIES_JSON=\n[{\"id\":\"cat-food\",\"name\":\"Ăn uống\",\"type\":\"EXPENSE\"},{\"id\":\"cat-fuel\",\"name\":\"Đi lại\",\"type\":\"EXPENSE\"},{\"id\":\"cat-salary\",\"name\":\"Lương\",\"type\":\"INCOME\"}]\n\nACCOUNTS_JSON=\n[{\"id\":\"acc-cash\",\"name\":\"Tiền mặt\",\"transactionEligible\":true},{\"id\":\"acc-bank\",\"name\":\"Vietcombank\",\"transactionEligible\":true}]\n\nRAW_TEXT=\năn trưa 30k tại quán cơm\n",
+        "role": "user"
+      }
+    ],
+    "model": "deepseek-chat",
+    "response_format": {
+      "type": "json_object"
+    },
+    "temperature": 0.0
+  },
+  "service_response": {
+    "accountId": "acc-cash",
+    "amount": 30000.0,
+    "categoryId": "cat-food",
+    "confidence": 0.9,
+    "missingFields": [],
+    "note": "ăn trưa",
+    "transactionDate": "2026-05-01T12:00:00+07:00",
+    "type": "EXPENSE",
+    "warnings": []
+  }
+}
