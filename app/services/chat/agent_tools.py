@@ -366,6 +366,30 @@ def _register_personal_finance_tools(agent: Agent[AppDeps, str]) -> None:
         """Xóa ngân sách. CHỈ gọi SAU KHI user xác nhận muốn xóa. budgetId lấy từ get_user_budgets."""
         return await _pf_request(ctx, "DELETE", f"/budget/budgets/{budgetId}")
 
+    @agent.tool
+    async def get_portfolio_analysis(
+        ctx: RunContext[AppDeps],
+        portfolioId: str | None = None,
+    ) -> dict:
+        """Lấy phân tích danh mục đầu tư của người dùng. Trả về: holdings (symbol, averagePrice, closePrice, unrealizedPnLPct, weightPct), totalMarketValue, totalCostBasis, unrealizedPnL, currentPE, currentPB, cashBalance, historyQuarters (PE/PB/ROE/ROA theo quý), allPortfolios (nếu có nhiều danh mục). Dùng khi user hỏi về danh mục, lãi lỗ, đánh giá sức khỏe danh mục, hoặc gợi ý đầu tư với tiền dư. Kết hợp với compute_fair_value (cho top 3 holdings theo weightPct) và get_personal_finance_report (cho tiền dư tháng) để phân tích toàn diện."""
+        base_url = settings.JAVA_BACKEND_URL.rstrip("/")
+        headers: dict[str, str] = {}
+        internal_key = (settings.INTERNAL_API_KEY or "").strip()
+        if internal_key:
+            headers["X-Internal-Api-Key"] = internal_key
+        params: dict[str, str] = {"userId": ctx.deps.user_id}
+        if portfolioId:
+            params["portfolioId"] = portfolioId
+        response = await get_http_client().get(
+            f"{base_url}/api/internal/portfolio/analysis",
+            params=params,
+            headers=headers,
+            timeout=httpx.Timeout(max(5, int(settings.CHAT_TOOL_TIMEOUT_SECONDS))),
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            raise RuntimeError(f"portfolio/analysis HTTP_{response.status_code}: {response.text[:300]}")
+        return response.json()
+
 
 # ── Compute fair value ─────────────────────────────────────────────────
 
