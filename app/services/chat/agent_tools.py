@@ -23,7 +23,7 @@ from app.core.http_client import get_http_client
 from app.infrastructure.llm_agent import get_deepseek_model
 from app.infrastructure.market_data_client import MarketDataToolClient
 from app.infrastructure.rag_client import RagRetrievalService
-from app.services.chat.prompts.agent_prompt import AGENT_SYSTEM_PROMPT
+from app.services.chat.prompts.agent_prompt import AGENT_SYSTEM_PROMPT, CFO_STRESS_ADDENDUM as _CFO_STRESS_ADDENDUM
 from app.services.chat.utils.vietnamese_text import sanitize_user_facing_message
 from app.services.chat.valuation_engine import compute_fair_value as _compute_fair_value
 from app.services.chat.valuation_inputs import fetch_valuation_inputs
@@ -33,12 +33,25 @@ logger = logging.getLogger(__name__)
 _VN_TZ = datetime.timezone(datetime.timedelta(hours=7))
 
 
+_CFO_TRIGGER_KEYWORDS = (
+    "cfo ảo", "stress tài chính", "quỹ dự phòng", "survival runway",
+    "tốc độ đầu tư", "monthly invest", "phân tích tài chính cá nhân",
+    "dòng tiền thặng dư", "dòng tiền", "thu nhập thặng dư",
+)
+
+
+def _is_cfo_context(user_message: str) -> bool:
+    lower = user_message.lower()
+    return any(kw in lower for kw in _CFO_TRIGGER_KEYWORDS)
+
+
 @dataclass
 class AppDeps:
     """Per-request dependencies injected into every tool via RunContext."""
     user_id: str
     market_client: MarketDataToolClient
     rag_service: RagRetrievalService
+    cfo_context: bool = False
 
 
 def build_chat_agent() -> Agent[AppDeps, str]:
@@ -59,8 +72,11 @@ def build_chat_agent() -> Agent[AppDeps, str]:
     @agent.system_prompt
     def _system_prompt(ctx: RunContext[AppDeps]) -> str:
         now = datetime.datetime.now(_VN_TZ)
+        base = AGENT_SYSTEM_PROMPT
+        if ctx.deps.cfo_context:
+            base += _CFO_STRESS_ADDENDUM
         return (
-            AGENT_SYSTEM_PROMPT
+            base
             + "\n\n--- THÔNG TIN NGỮ CẢNH HỆ THỐNG ---\n"
             + f"Thời gian hiện tại: {now.strftime('%Y-%m-%dT%H:%M:%S.%f%z')} "
             + f"({now.strftime('%A, %d/%m/%Y')})\n"

@@ -37,7 +37,7 @@ from app.models.chat import (
     ThreadSummaryRequest,
     ThreadSummaryResponse,
 )
-from app.services.chat.agent_tools import AppDeps, build_chat_agent
+from app.services.chat.agent_tools import AppDeps, build_chat_agent, _is_cfo_context
 from app.services.chat.trace_writer import ChatTraceWriter
 from app.services.chat.utils.json_io import parse_llm_json
 
@@ -67,6 +67,7 @@ class ChatOrchestrator:
             user_id=request.user_id,
             market_client=self._market_client,
             rag_service=self._rag_service,
+            cfo_context=_is_cfo_context(request.user_message),
         )
 
         trace = self._trace.enabled
