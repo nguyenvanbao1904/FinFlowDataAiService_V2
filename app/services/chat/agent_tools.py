@@ -35,8 +35,8 @@ _VN_TZ = datetime.timezone(datetime.timedelta(hours=7))
 
 _CFO_TRIGGER_KEYWORDS = (
     "cfo ảo", "stress tài chính", "quỹ dự phòng", "survival runway",
-    "tốc độ đầu tư", "monthly invest", "phân tích tài chính cá nhân",
-    "dòng tiền thặng dư", "dòng tiền", "thu nhập thặng dư",
+    "tốc độ đầu tư", "tỷ lệ đầu tư", "monthly invest", "phân tích tài chính cá nhân",
+    "dòng tiền thặng dư", "dòng tiền", "thu nhập thặng dư", "tiền dư hàng tháng",
 )
 
 
