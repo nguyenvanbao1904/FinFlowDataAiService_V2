@@ -40,12 +40,20 @@ class TransactionPrefillService:
         )
 
     async def prefill(self, request: TransactionPrefillRequest) -> TransactionPrefillResponse:
-        result = await self._agent.run(self._build_user_prompt(request))
+        try:
+            result = await self._agent.run(self._build_user_prompt(request))
+        except Exception as exc:
+            logger.error("[Prefill/Service] LLM failed: %s", exc)
+            raise
+
         parsed = parse_llm_json(result.output)
         if not isinstance(parsed, dict):
+            logger.warning("[Prefill/Service] output không phải dict (got %s) — dùng dict rỗng", type(parsed).__name__)
             parsed = {}
+
         response = TransactionPrefillResponse.model_validate(parsed)
-        return self._normalize_output(response, request)
+        normalized = self._normalize_output(response, request)
+        return normalized
 
     def _build_user_prompt(self, request: TransactionPrefillRequest) -> str:
         categories = [
@@ -114,13 +122,20 @@ class TransactionPrefillService:
 
         if output.amount is not None:
             if output.amount <= 0:
+                logger.warning("[Prefill/Normalize] amount=%s <= 0 — xóa", output.amount)
                 output.amount = None
+        else:
+            logger.warning("[Prefill/Normalize] LLM trả amount=None")
 
         if output.categoryId and output.categoryId not in allowed_categories:
+            logger.warning("[Prefill/Normalize] categoryId '%s' không hợp lệ (có %d items) — xóa",
+                          output.categoryId, len(allowed_categories))
             warnings.append("Hệ thống: categoryId không nằm trong danh sách cho phép")
             output.categoryId = None
 
         if output.accountId and output.accountId not in allowed_accounts:
+            logger.warning("[Prefill/Normalize] accountId '%s' không hợp lệ (có %d items) — xóa",
+                          output.accountId, len(allowed_accounts))
             warnings.append("Hệ thống: accountId không nằm trong danh sách cho phép")
             output.accountId = None
 
