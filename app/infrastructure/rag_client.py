@@ -309,6 +309,58 @@ class RagRetrievalService:
         if not self.chunks_db_path.exists():
             return []
 
+        fts_hits = self._keyword_search_fts_sync(query, ticker, years)
+        if fts_hits is not None:
+            return fts_hits
+
+        return self._keyword_search_count_fallback(query, ticker, years)
+
+    def _keyword_search_fts_sync(
+        self,
+        query: str,
+        ticker: str | None,
+        years: list[int],
+    ) -> list[dict[str, Any]] | None:
+        fts_query = self._build_fts_query(query)
+        if not fts_query:
+            return []
+
+        sql = """
+            SELECT chunk_id, bm25(chunks_fts) AS bm25_score
+            FROM chunks_fts
+            WHERE chunks_fts MATCH ?
+        """
+        params: list[Any] = [fts_query]
+        if ticker:
+            sql += " AND stock_code = ?"
+            params.append(str(ticker).upper())
+        if years:
+            placeholders = ",".join("?" for _ in years)
+            sql += f" AND CAST(year AS INTEGER) IN ({placeholders})"
+            params.extend([int(y) for y in years])
+        sql += " ORDER BY bm25_score ASC LIMIT ?"
+        params.append(self.keyword_topk)
+
+        try:
+            with sqlite3.connect(str(self.chunks_db_path)) as conn:
+                rows = conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError as exc:
+            logger.info("SQLite FTS keyword search unavailable, falling back to count scoring: %s", exc)
+            return None
+        except Exception:
+            logger.exception("SQLite FTS keyword query failed for %s", self.chunks_db_path)
+            return None
+
+        hits: list[dict[str, Any]] = []
+        for chunk_id, raw_score in rows:
+            try:
+                score = -float(raw_score)
+            except (TypeError, ValueError):
+                score = 0.0
+            hits.append({"chunk_id": str(chunk_id), "score": score, "source": "keyword"})
+        return hits
+
+    def _keyword_search_count_fallback(self, query: str, ticker: str | None, years: list[int]) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(query)
         if not keywords:
             return []
@@ -397,6 +449,19 @@ class RagRetrievalService:
                 seen.add(tok)
                 dedup.append(tok)
         return dedup[:12]
+
+    @staticmethod
+    def _build_fts_query(query: str) -> str:
+        terms: list[str] = []
+        for token in RagRetrievalService._extract_keywords(query):
+            safe = token.replace('"', '""')
+            if not safe:
+                continue
+            if len(safe) >= 3:
+                terms.append(f'"{safe}"*')
+            else:
+                terms.append(f'"{safe}"')
+        return " OR ".join(terms)
 
     @staticmethod
     def _keyword_score(text: str, keywords: list[str]) -> float:

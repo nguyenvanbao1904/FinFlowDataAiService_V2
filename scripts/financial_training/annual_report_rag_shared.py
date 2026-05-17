@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +18,6 @@ from bs4 import BeautifulSoup
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_DIR = ROOT / "artifacts" / "rag" / "annual_reports" / "raw_pdfs"
 DEFAULT_CHUNKS_JSON = ROOT / "artifacts" / "rag" / "annual_reports" / "chunks" / "annual_reports_chunks.json"
-DEFAULT_INDEX_JSON = ROOT / "artifacts" / "rag" / "annual_reports" / "index" / "annual_reports_bm25_index.json"
 DEFAULT_CRAWL_MANIFEST = ROOT / "artifacts" / "rag" / "annual_reports" / "raw_pdfs" / "crawl_manifest.json"
 
 
@@ -38,11 +36,6 @@ def _normalize_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text)
     without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     return re.sub(r"\s+", " ", without_accents.strip().lower())
-
-
-def _tokenize(text: str) -> list[str]:
-    normalized = _normalize_text(text)
-    return re.findall(r"[a-z0-9]{2,}", normalized)
 
 
 def _infer_stock_code_from_filename(file_name: str) -> str:
@@ -414,58 +407,3 @@ def _load_chunks(chunks_json: Path) -> list[dict[str, Any]]:
         return []
     return [item for item in data if isinstance(item, dict)]
 
-
-def _build_bm25_index(chunks: list[dict[str, Any]], k1: float = 1.5, b: float = 0.75) -> dict[str, Any]:
-    doc_term_freqs: list[dict[str, int]] = []
-    doc_lengths: list[int] = []
-    doc_freq: Counter[str] = Counter()
-    documents: list[dict[str, Any]] = []
-
-    for chunk in chunks:
-        title = str(chunk.get("subsection_title") or "")
-        body = str(chunk.get("text") or "")
-        full_text = f"{title}\n{body}".strip()
-        tokens = _tokenize(full_text)
-        tf = Counter(tokens)
-        doc_len = sum(tf.values())
-        doc_term_freqs.append(dict(tf))
-        doc_lengths.append(doc_len)
-        doc_freq.update(tf.keys())
-        documents.append(
-            {
-                "chunk_id": chunk.get("chunk_id"),
-                "stock_code": chunk.get("stock_code"),
-                "year": chunk.get("year"),
-                "category": chunk.get("category"),
-                "subsection_title": chunk.get("subsection_title"),
-                "source_file": chunk.get("source_file"),
-                "page_start": chunk.get("page_start"),
-                "page_end": chunk.get("page_end"),
-                "text_preview": body[:280],
-            }
-        )
-
-    total_docs = len(chunks)
-    avg_doc_len = (sum(doc_lengths) / total_docs) if total_docs else 0.0
-
-    idf: dict[str, float] = {}
-    for token, df in doc_freq.items():
-        idf[token] = math.log(1.0 + (total_docs - df + 0.5) / (df + 0.5))
-
-    inverted_index: dict[str, list[list[int]]] = defaultdict(list)
-    for doc_idx, tf_map in enumerate(doc_term_freqs):
-        for token, tf in tf_map.items():
-            inverted_index[token].append([doc_idx, tf])
-
-    return {
-        "schema": "annual_report_bm25_v1",
-        "built_at_utc": datetime.now(timezone.utc).isoformat(),
-        "documents_count": total_docs,
-        "avg_doc_len": avg_doc_len,
-        "k1": k1,
-        "b": b,
-        "doc_lengths": doc_lengths,
-        "idf": idf,
-        "inverted_index": dict(inverted_index),
-        "documents": documents,
-    }

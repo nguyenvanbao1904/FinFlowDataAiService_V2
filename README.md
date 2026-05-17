@@ -285,12 +285,11 @@ Flags: `--start-year 2013`, `--end-year` (mặc định: năm trước), `--out-
 #### Bước 2: Train pipeline
 
 ```bash
-# Eval pipeline — đánh giá model quality (có actual 2025 để so sánh)
-python scripts/financial_training/run_final_model_pipeline.py \
+# Walk-forward eval — một lệnh đánh giá ALL/VN100/VN30 qua nhiều fold
+python scripts/financial_training/run_model_walk_forward_eval.py \
   --source db \
-  --train-target-year-max 2024 \
-  --predict-target-year 2025 \
-  --out-dir artifacts/models/eval_pipeline
+  --fold-years 2022,2023,2024,2025 \
+  --out-dir artifacts/models/walk_forward_eval
 
 # Production pipeline — chatbot dùng
 python scripts/financial_training/run_final_model_pipeline.py \
@@ -300,7 +299,8 @@ python scripts/financial_training/run_final_model_pipeline.py \
   --out-dir artifacts/models/production_pipeline
 ```
 
-Output mỗi pipeline: 4 `.joblib` models + `report_table.csv` + `predict_detail.csv` + `summary.json` + `report_style.md`.
+Output walk-forward eval: `fold_metrics.csv`, `aggregate_metrics.csv`, `summary.json`, `report.md`, kèm từng fold ở `fold_<year>/`.
+Output production pipeline: 4 `.joblib` models + `report_table.csv` + `predict_detail.csv` + `summary.json` + `report_style.md`.
 
 Flags thường dùng:
 
@@ -317,6 +317,17 @@ Flags thường dùng:
 | `--profit-winsorize-lower-q` | `0` | Winsorize profit target (0=tắt). Thử nghiệm cho thấy tắt tốt hơn |
 
 > **Ghi chú thử nghiệm:** Huber loss + Winsorize đã được A/B test và cho kết quả kém hơn (R² profit rớt từ 0.920→0.884 VN30). Nguyên nhân: lợi nhuận bluechip biến động mạnh nhưng đó là tính chu kỳ thật, không phải nhiễu — nén lại sẽ phá hủy tín hiệu. Giữ code để thử nghiệm nhưng default = tắt.
+
+Walk-forward eval dùng expanding window:
+
+| Fold | Train | Test |
+|------|-------|------|
+| 2022 | <= 2021 | 2022 |
+| 2023 | <= 2022 | 2023 |
+| 2024 | <= 2023 | 2024 |
+| 2025 | <= 2024 | 2025 |
+
+Script tự tính metric cho 3 scope: `ALL`, `VN100`, `VN30` từ `predict_detail.csv` của từng fold. Có thể thêm `--reuse-existing` để chỉ aggregate lại các fold đã chạy.
 
 #### Bước 3: On-demand forecast (1 mã, nhiều năm)
 
@@ -339,15 +350,15 @@ artifacts/
 │   ├── macro_yearly_train.csv          # Nonbank macro (18 cols, 2013-2025)
 │   └── macro_yearly_train_bank.csv     # Bank macro (17 cols, 2013-2025)
 └── models/
-    ├── eval_pipeline/                  # Đánh giá (train→2024, predict→2025)
-    │   ├── bank_revenue_next.joblib
-    │   ├── bank_profit_after_tax_next.joblib
-    │   ├── nonbank_revenue_next.joblib
-    │   ├── nonbank_profit_after_tax_next.joblib
-    │   ├── report_table.csv            # Dự báo vs thực tế cho symbols đã chọn
-    │   ├── predict_detail.csv          # Chi tiết từng mã
-    │   ├── summary.json                # Config + metrics (WAPE, R², MAPE...)
-    │   └── report_style.md             # Markdown report
+    ├── walk_forward_eval/              # Đánh giá expanding-window ALL/VN100/VN30
+    │   ├── fold_2022/
+    │   ├── fold_2023/
+    │   ├── fold_2024/
+    │   ├── fold_2025/
+    │   ├── fold_metrics.csv
+    │   ├── aggregate_metrics.csv
+    │   ├── summary.json
+    │   └── report.md
     └── production_pipeline/            # Chatbot dùng (train→2025, predict→2026)
         ├── (same 4 .joblib + 4 reports)
         └── on_demand/                  # Cache on-demand forecasts
@@ -392,9 +403,9 @@ python scripts/financial_training/run_annual_report_rag_pipeline_from_db.py \
   --output-chunks-db artifacts/rag/annual_reports/chunks/annual_reports_chunks.sqlite
 ```
 
-Key flags: `--skip-crawl`, `--parser-backend kreuzberg|pymupdf`, `--exchange-filter HOSE,HNX,UPCOM`, `--limit-symbols N`, `--skip-index`, `--ocr-fix-garbled`, `--llm-repair-thinking`.
+Key flags: `--skip-crawl`, `--parser-backend kreuzberg|pymupdf`, `--exchange-filter HOSE,HNX,UPCOM`, `--limit-symbols N`, `--rebuild-fts-only`, `--ocr-fix-garbled`, `--llm-repair-thinking`.
 
-Outputs: raw PDFs, crawl manifest, chunks SQLite/JSON, BM25 index, per-worker shard DBs.
+Outputs: raw PDFs, crawl manifest, chunks SQLite/JSON with FTS5 BM25 keyword index, per-worker shard DBs.
 
 ### Embeddings (MLX BGE-M3)
 

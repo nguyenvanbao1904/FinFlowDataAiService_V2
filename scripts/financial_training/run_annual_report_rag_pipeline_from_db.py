@@ -19,9 +19,7 @@ try:
     from annual_report_rag_shared import (
         DEFAULT_CHUNKS_JSON,
         DEFAULT_CRAWL_MANIFEST,
-        DEFAULT_INDEX_JSON,
         DEFAULT_RAW_DIR,
-        _build_bm25_index,
         _collect_code_counter_from_pdfs,
         _download_pdf,
         _dedup_urls,
@@ -37,9 +35,7 @@ except ImportError:  # pragma: no cover
     from scripts.financial_training.annual_report_rag_shared import (
         DEFAULT_CHUNKS_JSON,
         DEFAULT_CRAWL_MANIFEST,
-        DEFAULT_INDEX_JSON,
         DEFAULT_RAW_DIR,
-        _build_bm25_index,
         _collect_code_counter_from_pdfs,
         _download_pdf,
         _dedup_urls,
@@ -67,6 +63,81 @@ DEFAULT_CHUNKS_DB = (
 )
 
 _ENSURED_CHUNKS_DB: set[str] = set()
+_FTS_WARNED_DBS: set[str] = set()
+
+
+def _chunk_fts_row(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(item.get("chunk_id") or ""),
+        str(item.get("stock_code") or ""),
+        int(item.get("year") or 0),
+        str(item.get("subsection_title") or item.get("chapter_hint") or ""),
+        str(item.get("text") or item.get("chunk_text") or item.get("content") or ""),
+        str(item.get("category") or "other"),
+        str(item.get("source_file") or ""),
+        int(item.get("page_start") or 0),
+        int(item.get("page_end") or 0),
+    )
+
+
+def _ensure_chunks_fts_schema(conn: sqlite3.Connection, db_path: Path) -> bool:
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                chunk_id UNINDEXED,
+                stock_code UNINDEXED,
+                year UNINDEXED,
+                title,
+                text,
+                category UNINDEXED,
+                source_file UNINDEXED,
+                page_start UNINDEXED,
+                page_end UNINDEXED,
+                tokenize = 'unicode61 remove_diacritics 2'
+            )
+            """
+        )
+        return True
+    except sqlite3.OperationalError as exc:
+        key = str(db_path.resolve())
+        if key not in _FTS_WARNED_DBS:
+            _FTS_WARNED_DBS.add(key)
+            print(f"[FTS][WARN] SQLite FTS5 unavailable for {db_path}: {exc}")
+        return False
+
+
+def _sync_chunks_fts(
+    conn: sqlite3.Connection,
+    rows: list[tuple[Any, ...]],
+    *,
+    replace_existing: bool = True,
+) -> int:
+    if not rows:
+        return 0
+    chunk_ids = [(str(row[0] or ""),) for row in rows if str(row[0] or "").strip()]
+    fts_rows = [row for row in rows if str(row[0] or "").strip()]
+    if not fts_rows:
+        return 0
+    if replace_existing:
+        conn.executemany("DELETE FROM chunks_fts WHERE chunk_id = ?", chunk_ids)
+    conn.executemany(
+        """
+        INSERT INTO chunks_fts (
+            chunk_id,
+            stock_code,
+            year,
+            title,
+            text,
+            category,
+            source_file,
+            page_start,
+            page_end
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        fts_rows,
+    )
+    return len(fts_rows)
 
 
 def _write_chunks_checkpoint(output_chunks: Path, chunks: list[dict[str, Any]]) -> None:
@@ -110,6 +181,7 @@ def _ensure_chunks_db_schema(db_path: Path) -> None:
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_stock_year ON chunks(stock_code, year)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)")
+                _ensure_chunks_fts_schema(conn, db_path)
                 conn.commit()
             _ENSURED_CHUNKS_DB.add(key)
             return
@@ -136,10 +208,12 @@ def _write_chunks_checkpoint_sqlite(
         return 0
 
     rows: list[tuple[Any, ...]] = []
+    fts_rows: list[tuple[Any, ...]] = []
     for item in chunks:
         chunk_id = str(item.get("chunk_id") or "").strip()
         if not chunk_id:
             continue
+        fts_rows.append(_chunk_fts_row(item))
         rows.append(
             (
                 chunk_id,
@@ -183,6 +257,7 @@ def _write_chunks_checkpoint_sqlite(
             """,
             rows,
         )
+        _sync_chunks_fts(conn, fts_rows)
         conn.commit()
 
     return len(rows)
@@ -223,6 +298,67 @@ def _load_chunks_from_db(db_path: Path) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             chunks.append(value)
     return chunks
+
+
+def _rebuild_chunks_fts(
+    db_path: Path,
+    *,
+    batch_size: int = 1000,
+    fast_pragmas: bool = True,
+) -> int:
+    if not db_path.exists():
+        print(f"[FTS][WARN] chunks_db_not_found={db_path}")
+        return 0
+
+    _ensure_chunks_db_schema(db_path)
+    batch = max(1, int(batch_size))
+    rebuilt = 0
+
+    with _open_chunks_db(db_path) as conn:
+        if not _ensure_chunks_fts_schema(conn, db_path):
+            return 0
+        if fast_pragmas:
+            try:
+                conn.execute("PRAGMA synchronous=OFF")
+                conn.execute("PRAGMA journal_mode=MEMORY")
+            except sqlite3.OperationalError as exc:
+                print(f"[FTS][WARN] fast_pragmas_unavailable={exc}")
+
+        conn.execute("BEGIN")
+        try:
+            conn.execute("DELETE FROM chunks_fts")
+            cursor = conn.execute(
+                """
+                SELECT chunk_json
+                FROM chunks
+                ORDER BY stock_code ASC, year ASC, chunk_id ASC
+                """
+            )
+            while True:
+                rows = cursor.fetchmany(batch)
+                if not rows:
+                    break
+                fts_rows: list[tuple[Any, ...]] = []
+                for row in rows:
+                    try:
+                        item = json.loads(str(row[0] or "{}"))
+                    except Exception:
+                        item = {}
+                    if isinstance(item, dict):
+                        fts_rows.append(_chunk_fts_row(item))
+                rebuilt += _sync_chunks_fts(conn, fts_rows, replace_existing=False)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        try:
+            conn.execute("PRAGMA optimize")
+        except sqlite3.OperationalError:
+            pass
+
+    print(f"[FTS][DONE] rebuilt_rows={rebuilt} db={db_path}")
+    return rebuilt
 
 
 def _cleanup_outputs_for_reset(
@@ -297,8 +433,6 @@ def _build_worker_command(
         str(worker_output_chunks_db),
         "--checkpoint-backend",
         str(args.checkpoint_backend),
-        "--output-index",
-        str(args.output_index),
         "--min-chars",
         str(args.min_chars),
         "--max-chars",
@@ -327,7 +461,6 @@ def _build_worker_command(
         str(args.llm_repair_max_chunks_per_file),
         "--limit-symbols",
         str(args.limit_symbols),
-        "--skip-index",
         "--skip-final-export",
     ]
 
@@ -405,19 +538,6 @@ def _finalize_from_storage(args: argparse.Namespace) -> int:
             f"export_json_skipped=true checkpoint_backend={checkpoint_backend}"
         )
 
-    if args.skip_index:
-        print("[INDEX] skipped by --skip-index")
-        return 0
-
-    index_data = _build_bm25_index(chunks_for_output)
-    args.output_index.parent.mkdir(parents=True, exist_ok=True)
-    args.output_index.write_text(json.dumps(index_data, ensure_ascii=False), encoding="utf-8")
-    print(
-        "[INDEX][DONE] "
-        f"documents={index_data['documents_count']} "
-        f"vocab={len(index_data.get('idf', {}))} "
-        f"output={args.output_index}"
-    )
     return 0
 
 
@@ -615,6 +735,11 @@ def _run_symbol_shard_partition(args: argparse.Namespace) -> int:
         "[WORKER][MERGE] "
         f"workers={shard_count} merged_rows={merged_rows} final_unique_chunks={final_count} "
         f"output_db={args.output_chunks_db}"
+    )
+    _rebuild_chunks_fts(
+        args.output_chunks_db,
+        batch_size=max(1, int(args.fts_rebuild_batch_size)),
+        fast_pragmas=True,
     )
     return _finalize_from_storage(args)
 
@@ -828,7 +953,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Delete each downloaded PDF right after successful chunking in streaming mode",
     )
     parser.add_argument("--skip-crawl", action="store_true")
-    parser.add_argument("--skip-index", action="store_true")
+    parser.add_argument(
+        "--rebuild-fts-only",
+        action="store_true",
+        help="Rebuild SQLite FTS5/BM25 index from --output-chunks-db and exit",
+    )
+    parser.add_argument(
+        "--fts-rebuild-batch-size",
+        type=int,
+        default=1000,
+        help="Batch size used by --rebuild-fts-only and worker DB merge rebuilds",
+    )
 
     parser.add_argument("--output-chunks", type=Path, default=DEFAULT_CHUNKS_JSON)
     parser.add_argument(
@@ -844,7 +979,6 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["sqlite", "json"],
         help="Checkpoint backend for chunk persistence (sqlite recommended for concurrent runs)",
     )
-    parser.add_argument("--output-index", type=Path, default=DEFAULT_INDEX_JSON)
     parser.add_argument(
         "--reset-output",
         action="store_true",
@@ -989,6 +1123,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
+
+    if bool(args.rebuild_fts_only):
+        return 0 if _rebuild_chunks_fts(
+            args.output_chunks_db,
+            batch_size=max(1, int(args.fts_rebuild_batch_size)),
+            fast_pragmas=True,
+        ) >= 0 else 2
 
     if str(args.worker_mode) == "exchange-partition":
         return _run_exchange_partition(args)
@@ -1356,20 +1497,6 @@ def main() -> int:
             f"saved_chunks={len(chunks_for_output)} export_json_skipped=true "
             f"checkpoint_backend={checkpoint_backend}"
         )
-
-    if args.skip_index:
-        print("[INDEX] skipped by --skip-index")
-        return 0
-
-    index_data = _build_bm25_index(chunks_for_output)
-    args.output_index.parent.mkdir(parents=True, exist_ok=True)
-    args.output_index.write_text(json.dumps(index_data, ensure_ascii=False), encoding="utf-8")
-    print(
-        "[INDEX][DONE] "
-        f"documents={index_data['documents_count']} "
-        f"vocab={len(index_data.get('idf', {}))} "
-        f"output={args.output_index}"
-    )
 
     return 0
 
