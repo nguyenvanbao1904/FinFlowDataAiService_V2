@@ -5,12 +5,14 @@ from fastapi import Header, HTTPException
 from app.core.config import settings
 from app.services.analytics_service import AnalyticsInsightsService
 from app.services.prefill_service import TransactionPrefillService
+from app.services.portfolio_insights_service import PortfolioInsightsService
 from app.services.chat.orchestrator import ChatOrchestrator
 
 logger = logging.getLogger(__name__)
 
 _analytics_insights_service: AnalyticsInsightsService | None = None
 _transaction_prefill_service: TransactionPrefillService | None = None
+_portfolio_insights_service: PortfolioInsightsService | None = None
 _chat_orchestrator: ChatOrchestrator | None = None
 
 
@@ -26,6 +28,13 @@ def get_prefill_service() -> TransactionPrefillService:
     if _transaction_prefill_service is None:
         _transaction_prefill_service = TransactionPrefillService()
     return _transaction_prefill_service
+
+
+def get_portfolio_insights_service() -> PortfolioInsightsService:
+    global _portfolio_insights_service
+    if _portfolio_insights_service is None:
+        _portfolio_insights_service = PortfolioInsightsService()
+    return _portfolio_insights_service
 
 
 def get_chat_orchestrator() -> ChatOrchestrator:

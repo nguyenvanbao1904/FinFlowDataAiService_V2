@@ -6,10 +6,12 @@ from app.core.config import settings
 from app.core.dependencies import (
     get_analytics_service,
     get_prefill_service,
+    get_portfolio_insights_service,
     require_internal_api_key,
 )
 from app.infrastructure.market_data_client import MarketDataToolClient
 from app.models.analytics import AnalyticsInsightsRequest, AnalyticsInsightsResponse
+from app.models.portfolio import PortfolioInsightsRequest, PortfolioInsightsResponse
 from app.models.transaction import TransactionPrefillRequest, TransactionPrefillResponse
 from app.models.valuation import FairValueRequest, FairValueResponse
 from app.services.chat.valuation_engine import compute_fair_value
@@ -60,6 +62,11 @@ async def transaction_prefill(request: TransactionPrefillRequest) -> Transaction
 @router.post("/analytics-insights", response_model=AnalyticsInsightsResponse)
 async def analytics_insights(request: AnalyticsInsightsRequest) -> AnalyticsInsightsResponse:
     return await get_analytics_service().generate(request)
+
+
+@router.post("/portfolio-insights", response_model=PortfolioInsightsResponse)
+async def portfolio_insights(request: PortfolioInsightsRequest) -> PortfolioInsightsResponse:
+    return await get_portfolio_insights_service().generate(request)
 
 
 @router.post("/fair-value", response_model=FairValueResponse)
