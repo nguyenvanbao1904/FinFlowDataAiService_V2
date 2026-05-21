@@ -4,6 +4,7 @@ from fastapi import Header, HTTPException
 
 from app.core.config import settings
 from app.services.analytics_service import AnalyticsInsightsService
+from app.services.home_insight_service import HomeInsightService
 from app.services.prefill_service import TransactionPrefillService
 from app.services.portfolio_insights_service import PortfolioInsightsService
 from app.services.chat.orchestrator import ChatOrchestrator
@@ -11,6 +12,7 @@ from app.services.chat.orchestrator import ChatOrchestrator
 logger = logging.getLogger(__name__)
 
 _analytics_insights_service: AnalyticsInsightsService | None = None
+_home_insight_service: HomeInsightService | None = None
 _transaction_prefill_service: TransactionPrefillService | None = None
 _portfolio_insights_service: PortfolioInsightsService | None = None
 _chat_orchestrator: ChatOrchestrator | None = None
@@ -21,6 +23,13 @@ def get_analytics_service() -> AnalyticsInsightsService:
     if _analytics_insights_service is None:
         _analytics_insights_service = AnalyticsInsightsService()
     return _analytics_insights_service
+
+
+def get_home_insight_service() -> HomeInsightService:
+    global _home_insight_service
+    if _home_insight_service is None:
+        _home_insight_service = HomeInsightService()
+    return _home_insight_service
 
 
 def get_prefill_service() -> TransactionPrefillService:
@@ -47,8 +56,16 @@ def get_chat_orchestrator() -> ChatOrchestrator:
 def require_internal_api_key(
     internal_api_key: str | None = Header(default=None, alias="X-Internal-Api-Key"),
 ) -> None:
-    if not settings.INTERNAL_API_KEY:
-        logger.warning("INTERNAL_API_KEY is not configured — all requests are allowed")
-        return
-    if not internal_api_key or internal_api_key != settings.INTERNAL_API_KEY:
+    expected_key = settings.INTERNAL_API_KEY.strip()
+    environment = settings.ENVIRONMENT.strip().lower()
+    if not expected_key:
+        if environment in {"local", "development", "test"}:
+            logger.warning(
+                "INTERNAL_API_KEY is not configured; allowing request in %s environment",
+                environment,
+            )
+            return
+        raise HTTPException(status_code=503, detail="Internal API key is not configured")
+    if not internal_api_key or internal_api_key != expected_key:
+        logger.warning("Rejected request with invalid internal API key")
         raise HTTPException(status_code=401, detail="Unauthorized internal API key")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import gc
 import hashlib
 import json
 import os
@@ -9,7 +8,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import requests
 from dotenv import load_dotenv
@@ -21,11 +20,14 @@ DEFAULT_CHUNKS_DB = PROJECT_ROOT / "artifacts" / "rag" / "annual_reports" / "chu
 DEFAULT_EMBEDDINGS_DB = (
     PROJECT_ROOT / "artifacts" / "rag" / "annual_reports" / "embeddings" / "annual_reports_embeddings.sqlite"
 )
-DEFAULT_EMBED_MODEL = "mlx-community/bge-m3-mlx-fp16"
-DEFAULT_BASE_URL = os.getenv("LOCAL_EMBEDDING_BASE_URL", os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:9090/v1"))
-DEFAULT_API_KEY = os.getenv("LOCAL_EMBEDDING_API_KEY", os.getenv("LOCAL_LLM_API_KEY", "no-key-required"))
-DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
-DEFAULT_QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "annual_report_chunks_bge_m3")
+DEFAULT_EMBED_MODEL = "voyage-3.5-lite"
+DEFAULT_BASE_URL = os.getenv("VOYAGE_EMBED_BASE_URL", "https://api.voyageai.com/v1")
+DEFAULT_API_KEY = os.getenv("VOYAGE_API_KEY", "")
+DEFAULT_QDRANT_URL = os.getenv("CHAT_QDRANT_URL", os.getenv("QDRANT_URL", "http://127.0.0.1:6333"))
+DEFAULT_QDRANT_COLLECTION = os.getenv(
+    "CHAT_QDRANT_COLLECTION",
+    os.getenv("QDRANT_COLLECTION", "annual_report_chunks_voyage_3_5_lite"),
+)
 DEFAULT_QDRANT_DISTANCE = os.getenv("QDRANT_DISTANCE", "cosine")
 
 
@@ -82,78 +84,12 @@ def _create_client(base_url: str, api_key: str, timeout_seconds: int) -> tuple[r
     return session, base_url.rstrip("/"), key, max(10, int(timeout_seconds))
 
 
-def _create_local_mlx_embedder(
-    model_ref: str,
-    *,
-    max_tokens: int,
-    clear_cache_every: int = 0,
-) -> Callable[[list[str]], list[list[float]]]:
-    try:
-        import mlx.core as mx  # type: ignore
-        from mlx_embeddings.utils import load  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "Local MLX embedding mode requires mlx-embeddings. Install in venv: ./venv/bin/pip install mlx-embeddings==0.1.0"
-        ) from exc
-
-    model, tokenizer = load(model_ref)
-    call_count = 0
-
-    def _embed(texts: list[str]) -> list[list[float]]:
-        nonlocal call_count
-        if not texts:
-            return []
-        inputs = tokenizer.batch_encode_plus(
-            texts,
-            return_tensors="mlx",
-            padding="max_length",
-            truncation=True,
-            max_length=max(32, int(max_tokens)),
-        )
-        outputs = model(
-            inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask"),
-        )
-        values = getattr(outputs, "text_embeds", None)
-        if values is None:
-            values = getattr(outputs, "pooler_output", None)
-        if values is None:
-            raise RuntimeError("MLX embedding output missing text_embeds/pooler_output")
-        mx.eval(values)
-        rows = values.tolist() if hasattr(values, "tolist") else []
-        del values
-        del outputs
-        del inputs
-
-        vectors: list[list[float]] = []
-        for row in rows:
-            vectors.append([float(x) for x in row])
-        if len(vectors) != len(texts):
-            raise RuntimeError(
-                f"MLX local embedding returned mismatched batch size. expected={len(texts)} actual={len(vectors)}"
-            )
-        call_count += 1
-        if clear_cache_every > 0 and call_count % clear_cache_every == 0:
-            try:
-                clear_fn = getattr(mx, "clear_cache", None)
-                if clear_fn is None:
-                    metal = getattr(mx, "metal", None)
-                    clear_fn = getattr(metal, "clear_cache", None) if metal is not None else None
-                if callable(clear_fn):
-                    clear_fn()
-            except Exception:
-                pass
-            gc.collect()
-        return vectors
-
-    return _embed
-
-
 def _embed_batch_with_retry(
     client: tuple[requests.Session, str, str, int],
     *,
     model: str,
     inputs: list[str],
+    input_type: str,
     max_retries: int,
     retry_sleep_seconds: float,
 ) -> list[list[float]]:
@@ -165,9 +101,12 @@ def _embed_batch_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             session, base_url, _api_key, timeout_seconds = client
+            payload: dict[str, Any] = {"model": model, "input": inputs}
+            if input_type:
+                payload["input_type"] = input_type
             response = session.post(
                 f"{base_url}/embeddings",
-                json={"model": model, "input": inputs},
+                json=payload,
                 timeout=timeout_seconds,
             )
             response.raise_for_status()
@@ -206,19 +145,6 @@ def _embed_batch_with_retry(
             time.sleep(sleep_seconds)
 
     raise RuntimeError(f"Embedding request failed after {attempts} attempts: {last_exc}")
-
-
-def _embed_batch_local(
-    local_embedder: Callable[[list[str]], list[list[float]]],
-    *,
-    inputs: list[str],
-) -> list[list[float]]:
-    vectors = local_embedder(inputs)
-    if len(vectors) != len(inputs):
-        raise RuntimeError(
-            f"Local embedding returned mismatched batch size. expected={len(inputs)} actual={len(vectors)}"
-        )
-    return vectors
 
 
 def _create_qdrant_client(url: str, api_key: str):
@@ -365,32 +291,20 @@ def _upsert_qdrant_batch(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build MLX embeddings for annual-report chunks from SQLite checkpoint")
+    parser = argparse.ArgumentParser(description="Build Voyage embeddings for annual-report chunks from SQLite checkpoint")
     parser.add_argument("--chunks-db", type=Path, default=DEFAULT_CHUNKS_DB)
     parser.add_argument("--output-db", type=Path, default=DEFAULT_EMBEDDINGS_DB)
     parser.add_argument("--embed-base-url", type=str, default=DEFAULT_BASE_URL)
     parser.add_argument("--embed-api-key", type=str, default=DEFAULT_API_KEY)
-    parser.add_argument("--embed-model", type=str, default=os.getenv("LOCAL_EMBEDDING_MODEL", DEFAULT_EMBED_MODEL))
-    parser.add_argument(
-        "--embed-mode",
-        type=str,
-        default=os.getenv("LOCAL_EMBEDDING_MODE", "http"),
-        choices=["http", "mlx-local"],
-        help="Embedding execution mode: http (OpenAI-compatible endpoint) or mlx-local (direct local MLX inference)",
-    )
+    parser.add_argument("--embed-model", type=str, default=os.getenv("VOYAGE_EMBED_MODEL", DEFAULT_EMBED_MODEL))
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-input-chars", type=int, default=3500)
     parser.add_argument(
-        "--mlx-max-tokens",
-        type=int,
-        default=512,
-        help="Max tokens per text for mlx-local mode tokenizer truncation",
-    )
-    parser.add_argument(
-        "--mlx-clear-cache-every",
-        type=int,
-        default=20,
-        help="In mlx-local mode, clear MLX cache and trigger GC every N batches (0 = disable)",
+        "--embed-input-type",
+        type=str,
+        default=os.getenv("VOYAGE_EMBED_INPUT_TYPE", "document"),
+        choices=["", "query", "document"],
+        help="Voyage embedding input_type. Use document when indexing chunks.",
     )
     parser.add_argument("--limit", type=int, default=0, help="Limit number of pending chunks to embed (0 = all)")
     parser.add_argument("--timeout-seconds", type=int, default=120)
@@ -399,7 +313,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sleep-ms", type=int, default=0, help="Optional sleep between batches to reduce thermal pressure")
     parser.add_argument("--qdrant-upsert", action="store_true", help="Upsert embeddings into Qdrant in the same run")
     parser.add_argument("--qdrant-url", type=str, default=DEFAULT_QDRANT_URL)
-    parser.add_argument("--qdrant-api-key", type=str, default=os.getenv("QDRANT_API_KEY", ""))
+    parser.add_argument("--qdrant-api-key", type=str, default=os.getenv("CHAT_QDRANT_API_KEY", os.getenv("QDRANT_API_KEY", "")))
     parser.add_argument("--qdrant-collection", type=str, default=DEFAULT_QDRANT_COLLECTION)
     parser.add_argument(
         "--qdrant-distance",
@@ -420,6 +334,98 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _chunk_rows_query() -> str:
+    return """
+        SELECT
+            c.chunk_id,
+            c.stock_code,
+            c.year,
+            c.category,
+            c.source_file,
+            c.page_start,
+            c.page_end,
+            COALESCE(json_extract(c.chunk_json, '$.subsection_title'), ''),
+            COALESCE(json_extract(c.chunk_json, '$.text'), ''),
+            e.text_sha256
+        FROM chunks_db.chunks c
+        LEFT JOIN embeddings e
+            ON e.chunk_id = c.chunk_id
+           AND e.model = ?
+        WHERE c.chunk_id > ?
+        ORDER BY c.chunk_id ASC
+        LIMIT ?
+    """
+
+
+def _collect_pending_rows(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    last_chunk_id: str,
+    wanted: int,
+    scan_limit: int,
+    max_input_chars: int,
+) -> tuple[list[tuple[Any, ...]], list[str], list[str], str, bool]:
+    pending_rows: list[tuple[Any, ...]] = []
+    pending_inputs: list[str] = []
+    pending_hashes: list[str] = []
+    cursor_after = last_chunk_id
+    exhausted = False
+
+    while len(pending_rows) < wanted:
+        rows = conn.execute(_chunk_rows_query(), (model, cursor_after, scan_limit)).fetchall()
+        if not rows:
+            exhausted = True
+            break
+
+        for row in rows:
+            cursor_after = str(row[0] or cursor_after)
+            title = str(row[7] or "")
+            text = str(row[8] or "")
+            payload = _build_input_text(title, text, max_input_chars=max_input_chars)
+            if not payload:
+                payload = str(row[0] or "")
+            text_sha256 = hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+            existing_sha = str(row[9] or "")
+            if existing_sha == text_sha256:
+                continue
+            pending_rows.append(row[:9])
+            pending_inputs.append(payload)
+            pending_hashes.append(text_sha256)
+            if len(pending_rows) >= wanted:
+                break
+
+    return pending_rows, pending_inputs, pending_hashes, cursor_after, exhausted
+
+
+def _count_pending_rows(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    max_input_chars: int,
+    limit: int,
+) -> int:
+    total = 0
+    last_chunk_id = ""
+    while True:
+        rows = conn.execute(_chunk_rows_query(), (model, last_chunk_id, 1000)).fetchall()
+        if not rows:
+            break
+        last_chunk_id = str(rows[-1][0] or last_chunk_id)
+        for row in rows:
+            title = str(row[7] or "")
+            text = str(row[8] or "")
+            payload = _build_input_text(title, text, max_input_chars=max_input_chars)
+            if not payload:
+                payload = str(row[0] or "")
+            text_sha256 = hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+            if str(row[9] or "") != text_sha256:
+                total += 1
+                if limit > 0 and total >= limit:
+                    return limit
+    return total
+
+
 def main() -> int:
     args = _build_parser().parse_args()
     chunks_db: Path = args.chunks_db
@@ -427,6 +433,7 @@ def main() -> int:
     model = str(args.embed_model).strip()
     batch_size = max(1, int(args.batch_size))
     max_input_chars = max(0, int(args.max_input_chars))
+    embed_input_type = str(args.embed_input_type or "").strip().lower()
     sleep_ms = max(0, int(args.sleep_ms))
 
     if not chunks_db.exists():
@@ -436,24 +443,11 @@ def main() -> int:
         print("[EMBED][ERR] --embed-model is empty")
         return 2
 
-    embed_mode = str(args.embed_mode).strip().lower()
-    client: tuple[requests.Session, str, str, int] | None = None
-    local_embedder: Callable[[list[str]], list[list[float]]] | None = None
-    if embed_mode == "http":
-        client = _create_client(
-            base_url=str(args.embed_base_url),
-            api_key=str(args.embed_api_key),
-            timeout_seconds=int(args.timeout_seconds),
-        )
-    elif embed_mode == "mlx-local":
-        local_embedder = _create_local_mlx_embedder(
-            model,
-            max_tokens=max(32, int(args.mlx_max_tokens)),
-            clear_cache_every=max(0, int(args.mlx_clear_cache_every)),
-        )
-    else:
-        print(f"[EMBED][ERR] unsupported embed_mode={embed_mode}")
-        return 2
+    client = _create_client(
+        base_url=str(args.embed_base_url),
+        api_key=str(args.embed_api_key),
+        timeout_seconds=int(args.timeout_seconds),
+    )
     qdrant_client: Any | None = None
     qdrant_collection = str(args.qdrant_collection).strip()
     qdrant_upserted = 0
@@ -486,23 +480,17 @@ def main() -> int:
             existing_row = conn.execute("SELECT COUNT(*) FROM embeddings WHERE model = ?", (model,)).fetchone()
             existing_for_model = int(existing_row[0]) if existing_row else 0
 
-            pending_sql = """
-                SELECT COUNT(*)
-                FROM chunks_db.chunks c
-                LEFT JOIN embeddings e
-                    ON e.chunk_id = c.chunk_id
-                   AND e.model = ?
-                WHERE e.chunk_id IS NULL
-            """
-            pending_row = conn.execute(pending_sql, (model,)).fetchone()
-            pending_total = int(pending_row[0]) if pending_row else 0
-            if int(args.limit) > 0:
-                pending_total = min(pending_total, int(args.limit))
+            pending_total = _count_pending_rows(
+                conn,
+                model=model,
+                max_input_chars=max_input_chars,
+                limit=max(0, int(args.limit)),
+            )
 
             print(
                 "[EMBED][START] "
                 f"model={model} total_chunks={total_chunks} existing_for_model={existing_for_model} pending={pending_total} "
-                f"batch_size={batch_size} embed_mode={embed_mode} "
+                f"batch_size={batch_size} "
                 f"embed_base_url={str(args.embed_base_url)} output_db={output_db}"
             )
             if pending_total <= 0:
@@ -522,72 +510,36 @@ def main() -> int:
                 if limit_remaining is not None:
                     current_limit = min(current_limit, limit_remaining)
 
-                rows = conn.execute(
-                    """
-                    SELECT
-                        c.chunk_id,
-                        c.stock_code,
-                        c.year,
-                        c.category,
-                        c.source_file,
-                        c.page_start,
-                        c.page_end,
-                        COALESCE(json_extract(c.chunk_json, '$.subsection_title'), ''),
-                        COALESCE(json_extract(c.chunk_json, '$.text'), '')
-                    FROM chunks_db.chunks c
-                    LEFT JOIN embeddings e
-                        ON e.chunk_id = c.chunk_id
-                       AND e.model = ?
-                    WHERE c.chunk_id > ?
-                      AND e.chunk_id IS NULL
-                    ORDER BY c.chunk_id ASC
-                    LIMIT ?
-                    """,
-                    (model, last_chunk_id, current_limit),
-                ).fetchall()
+                rows, inputs, text_sha256_values, last_chunk_id, exhausted = _collect_pending_rows(
+                    conn,
+                    model=model,
+                    last_chunk_id=last_chunk_id,
+                    wanted=current_limit,
+                    scan_limit=max(1000, current_limit * 10),
+                    max_input_chars=max_input_chars,
+                )
 
                 if not rows:
+                    if exhausted:
+                        break
                     break
 
-                last_chunk_id = str(rows[-1][0] or last_chunk_id)
-
-                inputs: list[str] = []
-                for row in rows:
-                    title = str(row[7] or "")
-                    text = str(row[8] or "")
-                    payload = _build_input_text(title, text, max_input_chars=max_input_chars)
-                    if not payload:
-                        payload = str(row[0] or "")
-                    inputs.append(payload)
-
-                if embed_mode == "mlx-local":
-                    if local_embedder is None:
-                        raise RuntimeError("Local embedder is not initialized")
-                    vectors = _embed_batch_local(
-                        local_embedder,
-                        inputs=inputs,
-                    )
-                else:
-                    if client is None:
-                        raise RuntimeError("HTTP embedding client is not initialized")
-                    vectors = _embed_batch_with_retry(
-                        client,
-                        model=model,
-                        inputs=inputs,
-                        max_retries=max(1, int(args.max_retries)),
-                        retry_sleep_seconds=max(0.5, float(args.retry_sleep_seconds)),
-                    )
+                vectors = _embed_batch_with_retry(
+                    client,
+                    model=model,
+                    inputs=inputs,
+                    input_type=embed_input_type,
+                    max_retries=max(1, int(args.max_retries)),
+                    retry_sleep_seconds=max(0.5, float(args.retry_sleep_seconds)),
+                )
 
                 records: list[tuple[Any, ...]] = []
                 qdrant_rows: list[tuple[Any, ...]] = []
                 qdrant_vectors: list[list[float]] = []
-                text_sha256_values: list[str] = []
-                for row, payload, vector in zip(rows, inputs, vectors):
+                for row, text_sha256, vector in zip(rows, text_sha256_values, vectors):
                     chunk_id = str(row[0] or "").strip()
                     if not chunk_id:
                         continue
-                    text_sha256 = hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
-                    text_sha256_values.append(text_sha256)
                     records.append(
                         (
                             chunk_id,

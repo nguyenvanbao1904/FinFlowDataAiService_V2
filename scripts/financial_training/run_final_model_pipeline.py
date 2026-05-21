@@ -96,6 +96,16 @@ PERCENT_LIKE_COLUMNS = [
     "profit_momentum_pct",
     "asset_growth_yoy",
     "profit_margin_change",
+    "gross_margin_calc_pct",
+    "gross_margin_change",
+    "cogs_ratio_pct",
+    "selling_expense_ratio_pct",
+    "managing_expense_ratio_pct",
+    "opex_ratio_pct",
+    "opex_ratio_change",
+    "operating_cashflow_to_revenue_pct",
+    "financing_cashflow_to_assets_pct",
+    "cash_conversion_change",
     "interest_deposit_12m_pct",
     "interest_loan_short_pct",
     "interest_loan_midlong_pct",
@@ -119,6 +129,9 @@ MACRO_LOG1P_NONNEGATIVE_COLUMNS = [
 EXTRA_ROBUST_CLIP_COLUMNS = [
     "vnindex_daily_return_mean_pct",
     "vnindex_growth_yoy_pct",
+    "operating_cashflow_to_profit",
+    "free_cashflow_to_profit",
+    "free_cashflow_proxy",
 ] + MACRO_LOG1P_NONNEGATIVE_COLUMNS
 
 
@@ -846,8 +859,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=ROOT / "artifacts" / "financial_training" / "symbol_industry_map_l3.csv",
     )
-    parser.add_argument("--macro-lag-years", type=int, default=1)
-    parser.add_argument("--nonbank-feature-budget", type=int, default=50)
+    parser.add_argument("--macro-lag-years", type=int, default=2)
+    parser.add_argument("--nonbank-feature-budget", type=int, default=80)
     parser.add_argument("--steel-boost", type=float, default=1.0)
     parser.add_argument(
         "--include-year-feature",
@@ -866,7 +879,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--recency-weight-mode",
         type=str,
         choices=["none", "linear", "exp"],
-        default="exp",
+        default="none",
         help="Weight newer training years more heavily (none/linear/exp).",
     )
     parser.add_argument(
@@ -946,8 +959,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profit-huber-slope",
         type=float,
-        default=0,
-        help="Huber delta for profit model. >0 enables reg:pseudohubererror instead of reg:absoluteerror. 0 keeps MAE (default: off).",
+        default=1.0,
+        help="Huber delta for profit model. >0 enables reg:pseudohubererror instead of reg:absoluteerror.",
     )
     parser.add_argument(
         "--profit-winsorize-lower-q",
@@ -1076,8 +1089,13 @@ def main() -> None:
         "net_debt_to_equity_pct",
         "receivable_ratio_pct",
         "gross_margin",
+        "gross_margin_calc_pct",
         "net_margin",
         "profit_margin_calc_pct",
+        "cogs_ratio_pct",
+        "selling_expense_ratio_pct",
+        "managing_expense_ratio_pct",
+        "opex_ratio_pct",
         "revenue_yoy_pct",
         "profit_yoy_pct",
         "revenue_lag1",
@@ -1098,6 +1116,14 @@ def main() -> None:
         "roe",
         "asset_growth_yoy",
         "profit_margin_change",
+        "gross_margin_change",
+        "opex_ratio_change",
+        "operating_cashflow_to_profit",
+        "operating_cashflow_to_revenue_pct",
+        "free_cashflow_proxy",
+        "free_cashflow_to_profit",
+        "financing_cashflow_to_assets_pct",
+        "cash_conversion_change",
         "revenue_momentum_delta",
         "current_ratio",
         "total_debt_over_equity",

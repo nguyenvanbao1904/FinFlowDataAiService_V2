@@ -5,12 +5,14 @@ from fastapi import APIRouter, Depends
 from app.core.config import settings
 from app.core.dependencies import (
     get_analytics_service,
+    get_home_insight_service,
     get_prefill_service,
     get_portfolio_insights_service,
     require_internal_api_key,
 )
 from app.infrastructure.market_data_client import MarketDataToolClient
 from app.models.analytics import AnalyticsInsightsRequest, AnalyticsInsightsResponse
+from app.models.home import HomeInsightRequest, HomeInsightResponse
 from app.models.portfolio import PortfolioInsightsRequest, PortfolioInsightsResponse
 from app.models.transaction import TransactionPrefillRequest, TransactionPrefillResponse
 from app.models.valuation import FairValueRequest, FairValueResponse
@@ -62,6 +64,11 @@ async def transaction_prefill(request: TransactionPrefillRequest) -> Transaction
 @router.post("/analytics-insights", response_model=AnalyticsInsightsResponse)
 async def analytics_insights(request: AnalyticsInsightsRequest) -> AnalyticsInsightsResponse:
     return await get_analytics_service().generate(request)
+
+
+@router.post("/home-insight", response_model=HomeInsightResponse)
+async def home_insight(request: HomeInsightRequest) -> HomeInsightResponse:
+    return await get_home_insight_service().generate(request)
 
 
 @router.post("/portfolio-insights", response_model=PortfolioInsightsResponse)

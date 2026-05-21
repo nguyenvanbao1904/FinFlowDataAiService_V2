@@ -194,75 +194,249 @@ def _extract_year(raw: Any, fallback_text: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def _fetch_cafef_annual_links_for_symbol(
+_VIETSTOCK_ANNUAL_RE = re.compile(
+    r"(bao\s*_?cao\s*_?thuong\s*_?nien|baocaothuongnien|bctn|"
+    r"bc\s*_?thuong\s*_?nien|annual\s*_?report|annualreport)",
+    re.IGNORECASE,
+)
+_VIETSTOCK_BAD_RE = re.compile(
+    r"(cbtt|cvcbtt|cv\s*_?cbtt|cong\s*_?bo\s*_?thong\s*_?tin|"
+    r"information\s*_?disclosure|phu\s*_?luc|"
+    r"bao\s*_?cao\s*_?phat\s*_?trien\s*_?ben\s*_?vung|sustainability|"
+    r"bao\s*_?cao\s*_?tai\s*_?chinh|bctc)",
+    re.IGNORECASE,
+)
+_VIETSTOCK_CHAPTER_RE = re.compile(
+    r"(chapter|chuong|part|[_\-\s]c\d+(?:[_\-\s]|$))",
+    re.IGNORECASE,
+)
+
+
+def _vietstock_token_from_html(html: str) -> str:
+    match = re.search(
+        r"name=__RequestVerificationToken\s+type=hidden\s+value=([^>\s]+)",
+        html or "",
+    )
+    if match:
+        return match.group(1)
+    match = re.search(
+        r'name=["\']__RequestVerificationToken["\'][^>]*value=["\']([^"\']+)["\']',
+        html or "",
+    )
+    return match.group(1) if match else ""
+
+
+def _vietstock_is_annual_text(text: str) -> bool:
+    return bool(_VIETSTOCK_ANNUAL_RE.search(_normalize_text(text)))
+
+
+def _vietstock_is_bad_child(text: str) -> bool:
+    return bool(_VIETSTOCK_BAD_RE.search(_normalize_text(text)))
+
+
+def _vietstock_is_chapter_child(text: str) -> bool:
+    return bool(_VIETSTOCK_CHAPTER_RE.search(_normalize_text(text)))
+
+
+def _fetch_vietstock_json(
+    session: requests.Session,
+    url: str,
+    data: dict[str, Any],
+    timeout_seconds: int,
+) -> Any:
+    response = session.post(url, data=data, timeout=timeout_seconds)
+    response.raise_for_status()
+    return response.json()
+
+
+def _select_vietstock_archive_pdf_children(
+    children: list[dict[str, Any]],
+    *,
+    year: int,
+) -> list[dict[str, Any]]:
+    pdfs = [
+        child
+        for child in children
+        if isinstance(child, dict)
+        and (
+            str(child.get("FileName") or "").lower().endswith(".pdf")
+            or str(child.get("Url") or "").lower().endswith(".pdf")
+        )
+    ]
+    if not pdfs:
+        return []
+
+    def child_text(child: dict[str, Any]) -> str:
+        return f"{child.get('FileName') or ''} {child.get('Url') or ''}"
+
+    annual_pdfs = [
+        child
+        for child in pdfs
+        if str(year) in _normalize_text(child_text(child))
+        and _vietstock_is_annual_text(child_text(child))
+        and not _vietstock_is_bad_child(child_text(child))
+    ]
+    chapter_pdfs = [
+        child
+        for child in annual_pdfs
+        if _vietstock_is_chapter_child(child_text(child))
+    ]
+    if len(chapter_pdfs) >= 3:
+        return sorted(chapter_pdfs, key=lambda child: str(child.get("FileName") or ""))
+
+    pool = annual_pdfs or pdfs
+    return [
+        max(
+            pool,
+            key=lambda child: int(child.get("FileSize") or 0),
+        )
+    ]
+
+
+def _fetch_vietstock_annual_reports_for_symbol(
     session: requests.Session,
     *,
     symbol: str,
-    market: str,
     years: int,
+    target_year: int = 0,
     timeout_seconds: int,
-) -> list[str]:
-    endpoint = (
-        "https://cafef.vn/du-lieu/Ajax/PageNew/FileBCTC.ashx"
-        f"?Symbol={symbol.lower()}&Type=3&Year=0"
+) -> list[dict[str, Any]]:
+    """Fetch annual-report PDF URLs from VietstockFinance document API.
+
+    VietstockFinance document type 2 is "Bao cao thuong nien". Archive
+    documents are expanded through /Data/ViewDocument, which returns direct PDF
+    children; when an annual report is split into chapters, all chapter PDFs are
+    returned as one logical report via the "links" field.
+    """
+
+    stock = str(symbol).strip().upper()
+    if not stock:
+        return []
+
+    old_headers = dict(session.headers)
+    referer = f"https://finance.vietstock.vn/{stock}/tai-tai-lieu.htm?doctype=2"
+    session.headers.update(
+        {
+            "Referer": referer,
+            "X-Requested-With": "XMLHttpRequest",
+        }
     )
-    referer = f"https://cafef.vn/du-lieu/{market.lower()}/{symbol.lower()}-bao-cao-tai-chinh.chn"
-
     try:
-        response = session.get(endpoint, timeout=timeout_seconds, headers={"Referer": referer})
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"[CAFEF][WARN] symbol={symbol} request_failed={exc}")
-        return []
+        try:
+            page = session.get(referer, timeout=timeout_seconds)
+            page.raise_for_status()
+            token = _vietstock_token_from_html(page.text)
+        except requests.RequestException as exc:
+            print(f"[VIETSTOCK][WARN] symbol={stock} page_failed={exc}")
+            return []
 
-    try:
-        payload = response.json()
-    except ValueError:
-        print(f"[CAFEF][WARN] symbol={symbol} invalid_json")
-        return []
+        try:
+            docs = _fetch_vietstock_json(
+                session,
+                "https://finance.vietstock.vn/data/getdocument",
+                {
+                    "code": stock,
+                    "page": 1,
+                    "type": 2,
+                    "__RequestVerificationToken": token,
+                },
+                timeout_seconds,
+            )
+        except (requests.RequestException, ValueError) as exc:
+            print(f"[VIETSTOCK][WARN] symbol={stock} document_api_failed={exc}")
+            return []
 
-    rows = payload.get("Data")
-    if not isinstance(rows, list):
-        print(f"[CAFEF][WARN] symbol={symbol} no_data_rows")
-        return []
+        if not isinstance(docs, list):
+            print(f"[VIETSTOCK][WARN] symbol={stock} invalid_document_rows")
+            return []
 
-    annual_rows: list[tuple[int, str, str]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        name = str(row.get("Name") or "").strip()
-        link = str(row.get("Link") or "").strip()
-        if not name or not link:
-            continue
+        selected_by_year: dict[int, dict[str, Any]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            title = str(doc.get("Title") or doc.get("FullName") or "").strip()
+            url = str(doc.get("Url") or "").strip().replace("http://", "https://")
+            ext = str(doc.get("FileExt") or "").strip().lower()
+            if not title or not url:
+                continue
 
-        normalized_name = _normalize_text(name)
-        if "bao cao thuong nien" not in normalized_name:
-            continue
-        if any(term in normalized_name for term in ("ban dieu le", "ban cao bach")):
-            continue
+            report_year = _extract_year(None, f"{title} {url}")
+            if report_year <= 0:
+                continue
+            if target_year > 0 and report_year != target_year:
+                continue
+            if report_year in selected_by_year:
+                continue
 
-        year = _extract_year(row.get("Year"), name)
-        if year <= 0:
-            continue
-        annual_rows.append((year, name, link))
+            links: list[str] = []
+            child_names: list[str] = []
+            if ext == ".pdf":
+                links = [url]
+            elif ext in {".zip", ".rar"}:
+                try:
+                    children = _fetch_vietstock_json(
+                        session,
+                        "https://finance.vietstock.vn/Data/ViewDocument",
+                        {
+                            "id": doc.get("FileInfoID"),
+                            "__RequestVerificationToken": token,
+                        },
+                        timeout_seconds,
+                    )
+                except (requests.RequestException, ValueError) as exc:
+                    print(
+                        f"[VIETSTOCK][WARN] symbol={stock} year={report_year} "
+                        f"archive_api_failed={exc}"
+                    )
+                    continue
+                if not isinstance(children, list):
+                    continue
+                chosen_children = _select_vietstock_archive_pdf_children(
+                    [child for child in children if isinstance(child, dict)],
+                    year=report_year,
+                )
+                links = [
+                    str(child.get("Url") or "").strip().replace("http://", "https://")
+                    for child in chosen_children
+                    if str(child.get("Url") or "").strip()
+                ]
+                child_names = [
+                    str(child.get("FileName") or "").strip()
+                    for child in chosen_children
+                    if str(child.get("FileName") or "").strip()
+                ]
+            else:
+                continue
 
-    annual_rows.sort(key=lambda item: item[0], reverse=True)
+            links = _dedup_urls(links)
+            if not links:
+                continue
 
-    selected: list[str] = []
-    used_years: set[int] = set()
-    for year, _name, link in annual_rows:
-        if year in used_years:
-            continue
-        used_years.add(year)
-        selected.append(link)
-        if years > 0 and len(selected) >= years:
-            break
+            selected_by_year[report_year] = {
+                "symbol": stock,
+                "year": report_year,
+                "name": title,
+                "link": links[0],
+                "links": links,
+                "source": "vietstock",
+                "file_names": child_names,
+            }
 
-    if not selected:
-        print(f"[CAFEF][WARN] symbol={symbol} no_annual_report_link")
-    else:
-        print(f"[CAFEF][OK] symbol={symbol} annual_links={len(selected)}")
-    return selected
+        selected = [
+            selected_by_year[year]
+            for year in sorted(selected_by_year.keys(), reverse=True)
+        ]
+        if years > 0:
+            selected = selected[:years]
+
+        if not selected:
+            print(f"[VIETSTOCK][WARN] symbol={stock} no_annual_report_link")
+        else:
+            print(f"[VIETSTOCK][OK] symbol={stock} annual_links={len(selected)}")
+        return selected
+    finally:
+        session.headers.clear()
+        session.headers.update(old_headers)
 
 
 def _discover_pdf_links_from_html(base_url: str, html: str, max_links_per_page: int) -> list[str]:
@@ -406,4 +580,3 @@ def _load_chunks(chunks_json: Path) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         return []
     return [item for item in data if isinstance(item, dict)]
-

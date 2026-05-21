@@ -1,8 +1,6 @@
 """Capture baseline for analytics_service against mocked DeepSeek."""
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from app.models.analytics import (

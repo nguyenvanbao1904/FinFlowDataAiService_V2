@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     PROJECT_NAME: str = "FinFlow Data & AI Service"
     API_V1_STR: str = "/api/v1"
+    ENVIRONMENT: str = "production"
 
     # Internal Java Backend
     JAVA_BACKEND_URL: str = "http://localhost:8080/api/internal"
@@ -29,10 +30,10 @@ class Settings(BaseSettings):
     CHAT_DEEPSEEK_INPUT_PRICE_PER_1M: float = 0.10
     CHAT_DEEPSEEK_OUTPUT_PRICE_PER_1M: float = 0.40
 
-    # Local embedding (OpenAI-compatible API for RAG vector search)
-    LOCAL_EMBEDDING_BASE_URL: str = ""
-    LOCAL_EMBEDDING_API_KEY: str = "no-key-required"
-    LOCAL_EMBEDDING_MODEL: str = ""
+    # Voyage embedding for RAG vector search.
+    VOYAGE_EMBED_BASE_URL: str = "https://api.voyageai.com/v1"
+    VOYAGE_EMBED_MODEL: str = "voyage-3.5-lite"
+    VOYAGE_EMBED_INPUT_TYPE: str = "query"
 
     # FireAnt (financial data, company profile, ICB tree)
     FIREANT_ACCESS_TOKEN: str = ""
@@ -56,19 +57,19 @@ class Settings(BaseSettings):
     )
     CHAT_QDRANT_URL: str = "http://127.0.0.1:6333"
     CHAT_QDRANT_API_KEY: str = ""
-    CHAT_QDRANT_COLLECTION: str = "annual_report_chunks_bge_m3"
-    CHAT_RAG_TOPK_VECTOR: int = 25
-    CHAT_RAG_TOPK_KEYWORD: int = 25
-    CHAT_RAG_TOPK_FINAL: int = 6
+    CHAT_QDRANT_COLLECTION: str = "annual_report_chunks_voyage_3_5_lite"
+    CHAT_RAG_TOPK_VECTOR: int = 50
+    CHAT_RAG_TOPK_KEYWORD: int = 50
+    CHAT_RAG_TOPK_FINAL: int = 5
+    CHAT_RAG_CONTEXT_MAX_CHARS: int = 1800
 
-    # Reranker — re-scores hybrid-retrieved chunks with a cross-encoder.
-    # Recommended: keep enabled; vector + keyword retrieval is fast but
-    # coarse, the cross-encoder bumps top-6 precision by ~20-30%.
+    # Voyage reranker re-scores hybrid-retrieved chunks after vector + keyword search.
     CHAT_RAG_RERANK_ENABLED: bool = True
-    CHAT_RAG_RERANK_URL: str = "http://127.0.0.1:9091/v1/rerank"
-    CHAT_RAG_RERANK_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    VOYAGE_RERANK_URL: str = "https://api.voyageai.com/v1/rerank"
+    VOYAGE_RERANK_MODEL: str = "rerank-2.5-lite"
+    VOYAGE_API_KEY: str = ""
     # Number of candidates fed into the reranker before keeping TOPK_FINAL.
-    CHAT_RAG_RERANK_CANDIDATES: int = 30
+    CHAT_RAG_RERANK_CANDIDATES: int = 64
     CHAT_RAG_RERANK_TIMEOUT_SECONDS: int = 30
     CHAT_DEBUG_LOG_PROMPTS: bool = False
     CHAT_DEBUG_LOG_MAX_CHARS: int = 8000
@@ -81,23 +82,13 @@ class Settings(BaseSettings):
 
     # Forecast (ML model artifacts produced by scripts/financial_training)
     CHAT_FORECAST_ENABLED: bool = True
-    CHAT_FORECAST_REPORT_TABLE_CSV: str = str(
-        _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "report_table.csv"
-    )
-    CHAT_FORECAST_DETAIL_CSV: str = str(
-        _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "predict_detail.csv"
-    )
     CHAT_FORECAST_SUMMARY_JSON: str = str(
         _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "summary.json"
     )
-    CHAT_FORECAST_ON_DEMAND_ENABLED: bool = True
-    CHAT_FORECAST_ON_DEMAND_SCRIPT: str = str(
+    CHAT_FORECAST_SCRIPT: str = str(
         _SERVICE_ROOT / "scripts" / "financial_training" / "test_final_models_forecast.py"
     )
-    CHAT_FORECAST_ON_DEMAND_OUTPUT_DIR: str = str(
-        _SERVICE_ROOT / "artifacts" / "models" / "production_pipeline" / "on_demand"
-    )
-    CHAT_FORECAST_ON_DEMAND_TIMEOUT_SECONDS: int = 180
+    CHAT_FORECAST_TIMEOUT_SECONDS: int = 180
     CHAT_FORECAST_TOP_FACTORS: int = 5
 
 

@@ -8,7 +8,6 @@ import pytest
 
 from app.models.chat import (
     ChatOrchestrateRequest,
-    ChatTurnMessage,
 )
 from tests.conftest import (
     load_baseline,

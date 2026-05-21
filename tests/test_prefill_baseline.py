@@ -5,10 +5,7 @@ after pydantic-ai migration we can verify both stay equivalent.
 """
 from __future__ import annotations
 
-import datetime as _dt
-import json
 import re
-from pathlib import Path
 
 import pytest
 

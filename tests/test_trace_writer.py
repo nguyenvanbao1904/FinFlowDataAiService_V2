@@ -9,7 +9,7 @@ import tempfile
 import pytest
 
 from app.models.chat import ChatOrchestrateRequest
-from tests.conftest import make_text_response, make_tool_call_response
+from tests.conftest import make_text_response
 
 
 @pytest.fixture

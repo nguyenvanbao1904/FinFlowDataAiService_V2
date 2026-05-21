@@ -115,16 +115,16 @@ class RagRetrievalService:
                     "source_title": str(source_title),
                     "page_number": int(page_number) if isinstance(page_number, int) else None,
                     "score": float(row["score"]),
-                    "text": text[:1800],
+                    "text": text,
                 }
             )
 
         trace_enabled = bool(settings.CHAT_TRACE_ENABLED)
 
         if rerank_enabled and len(candidates) > 1:
-            reranked = await self._rerank(query, candidates)
+            reranked = await self._rerank_voyage(query, candidates)
             if reranked is not None:
-                final = reranked[: self.final_topk]
+                final = self._prepare_llm_contexts(reranked[: self.final_topk])
                 if trace_enabled:
                     self._retrieve_traces.append({
                         "query": query,
@@ -134,7 +134,7 @@ class RagRetrievalService:
                 return final
             logger.info("Rerank fallback to RRF order")
 
-        final = candidates[: self.final_topk]
+        final = self._prepare_llm_contexts(candidates[: self.final_topk])
         if trace_enabled:
             self._retrieve_traces.append({
                 "query": query,
@@ -143,57 +143,72 @@ class RagRetrievalService:
             })
         return final
 
-    async def _rerank(
+    @staticmethod
+    def _prepare_llm_contexts(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        max_chars = int(settings.CHAT_RAG_CONTEXT_MAX_CHARS or 0)
+        if max_chars <= 0:
+            return [dict(chunk) for chunk in chunks]
+
+        prepared: list[dict[str, Any]] = []
+        for chunk in chunks:
+            row = dict(chunk)
+            text = row.get("text")
+            if isinstance(text, str) and len(text) > max_chars:
+                row["text"] = text[:max_chars]
+            prepared.append(row)
+        return prepared
+
+    async def _rerank_voyage(
         self,
         query: str,
         candidates: list[dict[str, Any]],
     ) -> list[dict[str, Any]] | None:
-        """Score (query, chunk) pairs with a cross-encoder. Returns reordered
-        candidates with the rerank score merged in, or None on failure."""
-        endpoint = (settings.CHAT_RAG_RERANK_URL or "").strip()
-        if not endpoint:
+        endpoint = (settings.VOYAGE_RERANK_URL or "https://api.voyageai.com/v1/rerank").strip()
+        api_key = (settings.VOYAGE_API_KEY or "").strip()
+        model = (settings.VOYAGE_RERANK_MODEL or "rerank-2.5-lite").strip()
+        if not endpoint or not api_key or not model:
+            logger.warning("Voyage rerank is not configured")
             return None
 
         documents = [c.get("text") or "" for c in candidates]
         payload = {
             "query": query,
             "documents": documents,
-            "model": settings.CHAT_RAG_RERANK_MODEL,
-            "top_n": self.final_topk,
+            "model": model,
+            "top_k": self.final_topk,
+            "return_documents": False,
+            "truncation": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
         }
         timeout = httpx.Timeout(max(2, int(settings.CHAT_RAG_RERANK_TIMEOUT_SECONDS)))
 
         try:
             client = get_http_client()
-            response = await client.post(endpoint, json=payload, timeout=timeout)
+            response = await client.post(endpoint, headers=headers, json=payload, timeout=timeout)
             response.raise_for_status()
             body = response.json()
         except httpx.HTTPStatusError as exc:
             logger.warning(
-                "Rerank HTTP %s from %s: %s",
-                exc.response.status_code, endpoint, exc.response.text[:300],
-            )
-            return None
-        except httpx.ConnectError as exc:
-            logger.warning(
-                "Rerank connection refused at %s — server not running? (%s)",
-                endpoint, exc,
+                "Voyage rerank HTTP %s: %s",
+                exc.response.status_code, exc.response.text[:300],
             )
             return None
         except httpx.TimeoutException:
-            logger.warning("Rerank timeout (%ds) at %s", timeout.read, endpoint)
+            logger.warning("Voyage rerank timeout (%ds)", timeout.read)
             return None
         except Exception as exc:
-            logger.warning(
-                "Rerank failed: %s: %s (endpoint=%s)",
-                type(exc).__name__, exc, endpoint,
-            )
+            logger.warning("Voyage rerank failed: %s: %s", type(exc).__name__, exc)
             return None
 
-        results = body.get("results") if isinstance(body, dict) else None
+        results = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(results, list):
+            results = body.get("results") if isinstance(body, dict) else None
         if not isinstance(results, list) or not results:
             logger.warning(
-                "Rerank returned empty/invalid body: keys=%s",
+                "Voyage rerank returned empty/invalid body: keys=%s",
                 list(body.keys()) if isinstance(body, dict) else type(body).__name__,
             )
             return None
@@ -211,6 +226,7 @@ class RagRetrievalService:
                 chunk["rerank_score"] = float(score)
             except (TypeError, ValueError):
                 pass
+            chunk["rerank_provider"] = "voyage"
             reordered.append(chunk)
         return reordered or None
 
@@ -225,17 +241,20 @@ class RagRetrievalService:
         return await asyncio.to_thread(self._query_qdrant, vector, ticker, years)
 
     async def _embed_query(self, query: str) -> list[float]:
-        base_url = (settings.LOCAL_EMBEDDING_BASE_URL or "").strip()
-        model = (settings.LOCAL_EMBEDDING_MODEL or "").strip()
+        base_url = (settings.VOYAGE_EMBED_BASE_URL or "").strip()
+        model = (settings.VOYAGE_EMBED_MODEL or "").strip()
         if not base_url or not model:
             return []
 
         endpoint = f"{base_url.rstrip('/')}/embeddings"
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {(settings.LOCAL_EMBEDDING_API_KEY or 'no-key-required').strip() or 'no-key-required'}",
+            "Authorization": f"Bearer {(settings.VOYAGE_API_KEY or '').strip()}",
         }
         payload = {"model": model, "input": query}
+        input_type = (settings.VOYAGE_EMBED_INPUT_TYPE or "query").strip().lower()
+        if input_type:
+            payload["input_type"] = input_type
         timeout = httpx.Timeout(max(5, int(settings.LLM_TIMEOUT_SECONDS)))
 
         try:
@@ -518,7 +537,6 @@ def _snapshot(candidates: list[dict[str, Any]], score_key: str = "score") -> lis
     """Compact summary of each candidate for trace — no full text."""
     out = []
     for i, c in enumerate(candidates):
-        score = c.get(score_key) if c.get(score_key) is not None else c.get("score")
         out.append({
             "rank": i + 1,
             "chunk_id": c.get("chunk_id"),

@@ -23,7 +23,7 @@ try:
         _collect_code_counter_from_pdfs,
         _download_pdf,
         _dedup_urls,
-        _fetch_cafef_annual_links_for_symbol,
+        _fetch_vietstock_annual_reports_for_symbol,
         _format_known_code_counts,
         _load_manifest,
         _load_chunks,
@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover
         _collect_code_counter_from_pdfs,
         _download_pdf,
         _dedup_urls,
-        _fetch_cafef_annual_links_for_symbol,
+        _fetch_vietstock_annual_reports_for_symbol,
         _format_known_code_counts,
         _load_manifest,
         _load_chunks,
@@ -181,6 +181,29 @@ def _ensure_chunks_db_schema(db_path: Path) -> None:
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_stock_year ON chunks(stock_code, year)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks(source_file)")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS report_sources (
+                        report_id TEXT PRIMARY KEY,
+                        stock_code TEXT NOT NULL,
+                        year INTEGER NOT NULL,
+                        source_url TEXT NOT NULL,
+                        source_name TEXT,
+                        file_name TEXT,
+                        file_sha256 TEXT,
+                        status TEXT NOT NULL,
+                        parser_backend TEXT,
+                        chunker_signature TEXT,
+                        chunks_count INTEGER NOT NULL DEFAULT 0,
+                        error_message TEXT,
+                        discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        processed_at TEXT,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_report_sources_stock_year ON report_sources(stock_code, year)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_report_sources_status ON report_sources(status)")
                 _ensure_chunks_fts_schema(conn, db_path)
                 conn.commit()
             _ENSURED_CHUNKS_DB.add(key)
@@ -270,6 +293,197 @@ def _count_chunks_in_db(db_path: Path) -> int:
     with _open_chunks_db(db_path) as conn:
         row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
     return int(row[0]) if row else 0
+
+
+def _report_id(stock_code: str, year: int) -> str:
+    return f"{str(stock_code or '').strip().upper()}_{int(year or 0)}"
+
+
+def _chunker_signature(args: argparse.Namespace) -> str:
+    relevant = {
+        "min_chars": int(args.min_chars),
+        "max_chars": int(args.max_chars),
+        "overlap_chars": int(args.overlap_chars),
+        "parser_backend": str(args.parser_backend),
+        "ocr_backend": str(args.ocr_backend),
+        "ocr_image_only": bool(args.ocr_image_only),
+        "ocr_force_all_pages": bool(args.ocr_force_all_pages),
+        "ocr_fix_garbled": bool(args.ocr_fix_garbled),
+        "keep_garbled_chunks": bool(args.keep_garbled_chunks),
+        "include_other": bool(args.include_other),
+        "llm_repair_garbled_chunks": bool(args.llm_repair_garbled_chunks),
+    }
+    raw = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_report_source(
+    db_path: Path,
+    *,
+    stock_code: str,
+    year: int,
+) -> dict[str, Any] | None:
+    if not db_path.exists():
+        return None
+    _ensure_chunks_db_schema(db_path)
+    with _open_chunks_db(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT report_id, stock_code, year, source_url, source_name, file_name,
+                   file_sha256, status, parser_backend, chunker_signature, chunks_count
+            FROM report_sources
+            WHERE report_id = ?
+            """,
+            (_report_id(stock_code, year),),
+        ).fetchone()
+    if not row:
+        return None
+    keys = [
+        "report_id",
+        "stock_code",
+        "year",
+        "source_url",
+        "source_name",
+        "file_name",
+        "file_sha256",
+        "status",
+        "parser_backend",
+        "chunker_signature",
+        "chunks_count",
+    ]
+    return dict(zip(keys, row))
+
+
+def _should_skip_report(
+    existing: dict[str, Any] | None,
+    *,
+    source_url: str,
+    parser_backend: str,
+    chunker_signature: str,
+    force_refresh_existing: bool,
+) -> bool:
+    if force_refresh_existing or not existing:
+        return False
+    return (
+        str(existing.get("status") or "") == "chunked"
+        and str(existing.get("source_url") or "") == str(source_url)
+        and str(existing.get("parser_backend") or "") == str(parser_backend)
+        and str(existing.get("chunker_signature") or "") == str(chunker_signature)
+        and int(existing.get("chunks_count") or 0) > 0
+    )
+
+
+def _mark_report_source(
+    db_path: Path,
+    *,
+    stock_code: str,
+    year: int,
+    source_url: str,
+    source_name: str,
+    file_name: str | None,
+    file_sha256: str | None,
+    status: str,
+    parser_backend: str,
+    chunker_signature: str,
+    chunks_count: int = 0,
+    error_message: str | None = None,
+) -> None:
+    _ensure_chunks_db_schema(db_path)
+    with _open_chunks_db(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO report_sources (
+                report_id,
+                stock_code,
+                year,
+                source_url,
+                source_name,
+                file_name,
+                file_sha256,
+                status,
+                parser_backend,
+                chunker_signature,
+                chunks_count,
+                error_message,
+                processed_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(report_id) DO UPDATE SET
+                source_url = excluded.source_url,
+                source_name = excluded.source_name,
+                file_name = excluded.file_name,
+                file_sha256 = excluded.file_sha256,
+                status = excluded.status,
+                parser_backend = excluded.parser_backend,
+                chunker_signature = excluded.chunker_signature,
+                chunks_count = excluded.chunks_count,
+                error_message = excluded.error_message,
+                processed_at = excluded.processed_at,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                _report_id(stock_code, year),
+                str(stock_code).upper(),
+                int(year),
+                source_url,
+                source_name,
+                file_name,
+                file_sha256,
+                status,
+                parser_backend,
+                chunker_signature,
+                int(chunks_count),
+                error_message,
+            ),
+        )
+        conn.commit()
+
+
+def _normalize_report_chunks(
+    chunks: list[dict[str, Any]],
+    *,
+    stock_code: str,
+    year: int,
+    source_url: str,
+    source_name: str,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    stock = str(stock_code).strip().upper()
+    for index, item in enumerate(chunks, start=1):
+        row = dict(item)
+        row["stock_code"] = stock
+        row["year"] = int(year)
+        row["chunk_id"] = f"{stock}_{int(year)}_{index:04d}"
+        row["source_url"] = source_url
+        row["source_name"] = source_name
+        normalized.append(row)
+    return normalized
+
+
+def _replace_report_chunks_sqlite(
+    db_path: Path,
+    chunks: list[dict[str, Any]],
+    *,
+    stock_code: str,
+    year: int,
+    worker_id: str,
+) -> int:
+    _ensure_chunks_db_schema(db_path)
+    stock = str(stock_code).strip().upper()
+    with _open_chunks_db(db_path) as conn:
+        existing_ids = [
+            (str(row[0]),)
+            for row in conn.execute(
+                "SELECT chunk_id FROM chunks WHERE stock_code = ? AND year = ?",
+                (stock, int(year)),
+            ).fetchall()
+        ]
+        if existing_ids:
+            conn.executemany("DELETE FROM chunks_fts WHERE chunk_id = ?", existing_ids)
+        conn.execute("DELETE FROM chunks WHERE stock_code = ? AND year = ?", (stock, int(year)))
+        conn.commit()
+
+    return _write_chunks_checkpoint_sqlite(db_path, chunks, worker_id=worker_id)
 
 
 def _load_chunks_from_db(db_path: Path) -> list[dict[str, Any]]:
@@ -411,8 +625,10 @@ def _build_worker_command(
         "single",
         "--worker-id",
         worker_id,
-        "--cafef-years",
-        str(args.cafef_years),
+        "--report-years",
+        str(args.report_years),
+        "--report-target-year",
+        str(args.report_target_year),
         "--exchange-filter",
         exchange_filter_value,
         "--shard-count",
@@ -466,6 +682,8 @@ def _build_worker_command(
 
     if args.streaming:
         cmd.append("--streaming")
+    if args.force_refresh_existing:
+        cmd.append("--force-refresh-existing")
     if args.delete_pdf_after_chunk:
         cmd.append("--delete-pdf-after-chunk")
     if args.skip_crawl:
@@ -916,10 +1134,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--cafef-years",
+        "--report-years",
+        dest="report_years",
         type=int,
         default=5,
         help="Number of latest annual reports to collect per symbol",
+    )
+    parser.add_argument(
+        "--report-target-year",
+        dest="report_target_year",
+        type=int,
+        default=0,
+        help="Only process annual reports for this exact year (0 = latest N reports by --report-years)",
+    )
+    parser.add_argument(
+        "--force-refresh-existing",
+        action="store_true",
+        help="Re-download/re-chunk reports even when registry says the same source/config was already processed",
     )
     parser.add_argument(
         "--exchange-filter",
@@ -1242,8 +1473,10 @@ def main() -> int:
         session = requests.Session()
         session.headers.update({"User-Agent": str(args.user_agent)})
 
-        years = max(1, int(args.cafef_years))
+        years = max(1, int(args.report_years))
+        target_year = int(args.report_target_year or 0)
         timeout_seconds = max(5, int(args.crawl_timeout))
+        active_chunker_signature = _chunker_signature(args)
 
         all_links: list[str] = []
         symbols_with_links = 0
@@ -1268,105 +1501,216 @@ def main() -> int:
             }
 
             for symbol, exchange in symbol_exchange_pairs:
-                market = _exchange_to_market(exchange)
-                links = _fetch_cafef_annual_links_for_symbol(
+                reports = _fetch_vietstock_annual_reports_for_symbol(
                     session,
                     symbol=symbol,
-                    market=market,
                     years=years,
+                    target_year=target_year,
                     timeout_seconds=timeout_seconds,
                 )
+                links = [
+                    str(link)
+                    for report in reports
+                    for link in (report.get("links") or [report.get("link")])
+                    if str(link or "").strip()
+                ]
                 if links:
                     symbols_with_links += 1
                 all_links.extend(links)
 
-                for url in links:
-                    if url in seen_urls:
+                for report in reports:
+                    report_urls = _dedup_urls(
+                        [
+                            str(link or "").strip()
+                            for link in (report.get("links") or [report.get("link")])
+                            if str(link or "").strip()
+                        ]
+                    )
+                    report_year = int(report.get("year") or 0)
+                    report_name = str(report.get("name") or "")
+                    source_url = "|".join(report_urls)
+                    if not report_urls or report_year <= 0:
                         continue
-                    seen_urls.add(url)
+
+                    existing_report = _get_report_source(
+                        args.output_chunks_db,
+                        stock_code=symbol,
+                        year=report_year,
+                    )
+                    if _should_skip_report(
+                        existing_report,
+                        source_url=source_url,
+                        parser_backend=str(args.parser_backend),
+                        chunker_signature=active_chunker_signature,
+                        force_refresh_existing=bool(args.force_refresh_existing),
+                    ):
+                        crawl_summary["deduplicated"] += 1
+                        print(
+                            f"[RAG][SKIP] already_chunked symbol={symbol} "
+                            f"year={report_year} parts={len(report_urls)}"
+                        )
+                        continue
 
                     crawl_summary["sources"] += 1
-                    crawl_summary["discovered_pdf_links"] += 1
+                    crawl_summary["discovered_pdf_links"] += len(report_urls)
 
-                    status, saved_path, reason = _download_pdf(
-                        session=session,
-                        url=url,
-                        raw_dir=raw_dir,
-                        timeout_seconds=timeout_seconds,
-                        known_hashes=known_hashes,
-                        manifest_items=manifest_items,
-                    )
-                    if status == "downloaded":
-                        crawl_summary["downloaded"] += 1
-                        if saved_path is None:
+                    saved_paths: list[Path] = []
+                    part_hashes: list[str] = []
+                    for url in report_urls:
+                        if url in seen_urls:
                             continue
+                        seen_urls.add(url)
 
-                        print(f"[CRAWL][OK] downloaded {url} -> {saved_path.name}")
+                        status, saved_path, reason = _download_pdf(
+                            session=session,
+                            url=url,
+                            raw_dir=raw_dir,
+                            timeout_seconds=timeout_seconds,
+                            known_hashes=known_hashes,
+                            manifest_items=manifest_items,
+                        )
+                        if status == "downloaded":
+                            crawl_summary["downloaded"] += 1
+                            if saved_path is None:
+                                continue
+                            print(f"[CRAWL][OK] downloaded {url} -> {saved_path.name}")
+                            saved_paths.append(saved_path)
+                            try:
+                                part_hashes.append(hashlib.sha256(saved_path.read_bytes()).hexdigest())
+                            except Exception:
+                                pass
+                        elif status == "deduplicated":
+                            crawl_summary["deduplicated"] += 1
+                            print(f"[CRAWL][SKIP] duplicate content {url}")
+                        else:
+                            crawl_summary["failed"] += 1
+                            print(f"[CRAWL][WARN] failed {url}: {reason}")
 
-                        try:
+                    if not saved_paths:
+                        _mark_report_source(
+                            args.output_chunks_db,
+                            stock_code=symbol,
+                            year=report_year,
+                            source_url=source_url,
+                            source_name=report_name,
+                            file_name=None,
+                            file_sha256=None,
+                            status="failed",
+                            parser_backend=str(args.parser_backend),
+                            chunker_signature=active_chunker_signature,
+                            chunks_count=0,
+                            error_message="no_pdf_downloaded",
+                        )
+                        continue
+
+                    try:
+                        raw_file_chunks: list[dict[str, Any]] = []
+                        for saved_path in saved_paths:
                             file_chunks = chunker.process_pdf(saved_path)
-                            added = 0
-                            new_file_chunks: list[dict[str, Any]] = []
-                            for item in file_chunks:
-                                if checkpoint_backend == "json":
-                                    chunk_id = item.get("chunk_id")
-                                    key = str(chunk_id) if chunk_id is not None else ""
-                                    if key and key in existing_chunk_ids:
-                                        continue
-                                    if key:
-                                        existing_chunk_ids.add(key)
-                                    chunks.append(item)
-                                new_file_chunks.append(item)
-                                added += 1
+                            raw_file_chunks.extend(file_chunks)
                             print(
-                                f"[STREAM][CHUNK] file={saved_path.name} chunks={len(file_chunks)} added={added}"
+                                f"[STREAM][CHUNK] file={saved_path.name} "
+                                f"chunks={len(file_chunks)}"
                             )
-                            if checkpoint_backend == "sqlite":
-                                saved = _write_chunks_checkpoint_sqlite(
-                                    args.output_chunks_db,
-                                    new_file_chunks,
-                                    worker_id=str(args.worker_id),
-                                )
-                                print(
-                                    "[STREAM][CHECKPOINT] "
-                                    f"saved_chunks={saved} checkpoint={args.output_chunks_db}"
-                                )
-                            else:
-                                _write_chunks_checkpoint(args.output_chunks, chunks)
-                                print(
-                                    "[STREAM][CHECKPOINT] "
-                                    f"saved_chunks={len(chunks)} output={args.output_chunks}"
-                                )
-                            if args.delete_pdf_after_chunk:
+
+                        file_chunks = _normalize_report_chunks(
+                            raw_file_chunks,
+                            stock_code=symbol,
+                            year=report_year,
+                            source_url=source_url,
+                            source_name=report_name,
+                        )
+                        added = 0
+                        new_file_chunks: list[dict[str, Any]] = []
+                        for item in file_chunks:
+                            if checkpoint_backend == "json":
+                                chunk_id = item.get("chunk_id")
+                                key = str(chunk_id) if chunk_id is not None else ""
+                                if key and key in existing_chunk_ids:
+                                    continue
+                                if key:
+                                    existing_chunk_ids.add(key)
+                                chunks.append(item)
+                            new_file_chunks.append(item)
+                            added += 1
+                        print(
+                            f"[STREAM][CHUNK] symbol={symbol} year={report_year} "
+                            f"parts={len(saved_paths)} chunks={len(file_chunks)} added={added}"
+                        )
+                        if checkpoint_backend == "sqlite":
+                            saved = _replace_report_chunks_sqlite(
+                                args.output_chunks_db,
+                                new_file_chunks,
+                                stock_code=symbol,
+                                year=report_year,
+                                worker_id=str(args.worker_id),
+                            )
+                            _mark_report_source(
+                                args.output_chunks_db,
+                                stock_code=symbol,
+                                year=report_year,
+                                source_url=source_url,
+                                source_name=report_name,
+                                file_name="|".join(path.name for path in saved_paths),
+                                file_sha256=hashlib.sha256("|".join(part_hashes).encode()).hexdigest()
+                                if part_hashes else None,
+                                status="chunked",
+                                parser_backend=str(args.parser_backend),
+                                chunker_signature=active_chunker_signature,
+                                chunks_count=saved,
+                            )
+                            print(
+                                "[STREAM][CHECKPOINT] "
+                                f"saved_chunks={saved} checkpoint={args.output_chunks_db}"
+                            )
+                        else:
+                            _write_chunks_checkpoint(args.output_chunks, chunks)
+                            print(
+                                "[STREAM][CHECKPOINT] "
+                                f"saved_chunks={len(chunks)} output={args.output_chunks}"
+                            )
+                        if args.delete_pdf_after_chunk:
+                            for saved_path in saved_paths:
                                 try:
                                     saved_path.unlink()
                                     print(f"[STREAM][CLEAN] deleted {saved_path.name}")
                                 except Exception as exc:
                                     print(f"[STREAM][WARN] cannot delete {saved_path.name}: {exc}")
-                        except KeyboardInterrupt:
-                            if checkpoint_backend == "sqlite":
-                                pass
-                            else:
-                                _write_chunks_checkpoint(args.output_chunks, chunks)
-                            print(
-                                "[STREAM][STOP] interrupted_by_user=true "
-                                f"saved_chunks={len(chunks) if checkpoint_backend == 'json' else _count_chunks_in_db(args.output_chunks_db)} "
-                                f"checkpoint={'output_json=' + str(args.output_chunks) if checkpoint_backend == 'json' else 'db=' + str(args.output_chunks_db)}"
-                            )
-                            return 130
-                        except Exception as exc:
-                            print(f"[STREAM][WARN] chunk_failed file={saved_path.name}: {exc}")
-                    elif status == "deduplicated":
-                        crawl_summary["deduplicated"] += 1
-                        print(f"[CRAWL][SKIP] duplicate content {url}")
-                    else:
-                        crawl_summary["failed"] += 1
-                        print(f"[CRAWL][WARN] failed {url}: {reason}")
+                    except KeyboardInterrupt:
+                        if checkpoint_backend == "sqlite":
+                            pass
+                        else:
+                            _write_chunks_checkpoint(args.output_chunks, chunks)
+                        print(
+                            "[STREAM][STOP] interrupted_by_user=true "
+                            f"saved_chunks={len(chunks) if checkpoint_backend == 'json' else _count_chunks_in_db(args.output_chunks_db)} "
+                            f"checkpoint={'output_json=' + str(args.output_chunks) if checkpoint_backend == 'json' else 'db=' + str(args.output_chunks_db)}"
+                        )
+                        return 130
+                    except Exception as exc:
+                        _mark_report_source(
+                            args.output_chunks_db,
+                            stock_code=symbol,
+                            year=report_year,
+                            source_url=source_url,
+                            source_name=report_name,
+                            file_name="|".join(path.name for path in saved_paths),
+                            file_sha256=None,
+                            status="failed",
+                            parser_backend=str(args.parser_backend),
+                            chunker_signature=active_chunker_signature,
+                            chunks_count=0,
+                            error_message=str(exc)[:1000],
+                        )
+                        print(
+                            f"[STREAM][WARN] chunk_failed symbol={symbol} "
+                            f"year={report_year}: {exc}"
+                        )
 
             _save_manifest(args.crawl_manifest, manifest)
 
             print(
-                "[CAFEF][SUMMARY] "
+                "[VIETSTOCK][SUMMARY] "
                 f"symbols={len(symbol_exchange_pairs)} "
                 f"symbols_with_links={symbols_with_links} "
                 f"links_total={len(_dedup_urls(all_links))}"
@@ -1381,21 +1725,26 @@ def main() -> int:
             )
         else:
             for symbol, exchange in symbol_exchange_pairs:
-                market = _exchange_to_market(exchange)
-                links = _fetch_cafef_annual_links_for_symbol(
+                reports = _fetch_vietstock_annual_reports_for_symbol(
                     session,
                     symbol=symbol,
-                    market=market,
                     years=years,
+                    target_year=target_year,
                     timeout_seconds=timeout_seconds,
                 )
+                links = [
+                    str(link)
+                    for report in reports
+                    for link in (report.get("links") or [report.get("link")])
+                    if str(link or "").strip()
+                ]
                 if links:
                     symbols_with_links += 1
                     all_links.extend(links)
 
             source_urls = _dedup_urls(all_links)
             print(
-                "[CAFEF][SUMMARY] "
+                "[VIETSTOCK][SUMMARY] "
                 f"symbols={len(symbol_exchange_pairs)} "
                 f"symbols_with_links={symbols_with_links} "
                 f"links_total={len(source_urls)}"

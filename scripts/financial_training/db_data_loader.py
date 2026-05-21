@@ -303,6 +303,25 @@ def _add_nonbank_derived(df: pd.DataFrame) -> pd.DataFrame:
     out["net_margin"] = np.where(rev != 0, (pf / rev) * 100, 0)
     out["profit_margin_calc_pct"] = out["net_margin"]
 
+    gross_profit = pd.to_numeric(out.get("gross_profit", 0), errors="coerce").fillna(0)
+    cogs = pd.to_numeric(out.get("cost_of_goods_sold", 0), errors="coerce").fillna(0)
+    selling = pd.to_numeric(out.get("selling_expense", 0), errors="coerce").fillna(0)
+    managing = pd.to_numeric(out.get("managing_expense", 0), errors="coerce").fillna(0)
+    op_cf = pd.to_numeric(out.get("operating_cashflow", 0), errors="coerce").fillna(0)
+    inv_cf = pd.to_numeric(out.get("investing_cashflow", 0), errors="coerce").fillna(0)
+    fin_cf = pd.to_numeric(out.get("financing_cashflow", 0), errors="coerce").fillna(0)
+
+    out["gross_margin_calc_pct"] = np.where(rev != 0, (gross_profit / rev) * 100, 0)
+    out["cogs_ratio_pct"] = np.where(rev != 0, (cogs.abs() / rev.abs()) * 100, 0)
+    out["selling_expense_ratio_pct"] = np.where(rev != 0, (selling.abs() / rev.abs()) * 100, 0)
+    out["managing_expense_ratio_pct"] = np.where(rev != 0, (managing.abs() / rev.abs()) * 100, 0)
+    out["opex_ratio_pct"] = out["selling_expense_ratio_pct"] + out["managing_expense_ratio_pct"]
+    out["operating_cashflow_to_profit"] = np.where(pf != 0, op_cf / pf, 0)
+    out["operating_cashflow_to_revenue_pct"] = np.where(rev != 0, (op_cf / rev) * 100, 0)
+    out["free_cashflow_proxy"] = op_cf + inv_cf
+    out["free_cashflow_to_profit"] = np.where(pf != 0, out["free_cashflow_proxy"] / pf, 0)
+    out["financing_cashflow_to_assets_pct"] = np.where(ta != 0, (fin_cf / ta) * 100, 0)
+
     net_debt_cols = ["short_term_borrowings", "long_term_borrowings"]
     net_debt = sum(pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
                    for c in net_debt_cols)
@@ -345,6 +364,9 @@ def _add_nonbank_derived(df: pd.DataFrame) -> pd.DataFrame:
         rev_l1 != 0, ((rev - rev_l1) / rev_l1.abs()) * 100, 0)
     out["profit_momentum_pct"] = np.where(
         pf_l1 != 0, ((pf - pf_l1) / pf_l1.abs()) * 100, 0)
+    out["gross_margin_change"] = by_sym["gross_margin_calc_pct"].diff().fillna(0)
+    out["opex_ratio_change"] = by_sym["opex_ratio_pct"].diff().fillna(0)
+    out["cash_conversion_change"] = by_sym["operating_cashflow_to_profit"].diff().fillna(0)
 
     # Fallbacks
     roe_fb = np.where(eq != 0, pf / eq, 0)

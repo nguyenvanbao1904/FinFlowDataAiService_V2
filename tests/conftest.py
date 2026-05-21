@@ -18,7 +18,9 @@ os.environ.setdefault("DEEPSEEK_API_KEY", "sk-test-key")
 os.environ.setdefault("INTERNAL_API_KEY", "test-internal-key")
 os.environ.setdefault("JAVA_BACKEND_URL", "http://backend.test/api/internal")
 os.environ.setdefault("CHAT_RAG_ENABLED", "false")
-os.environ.setdefault("LOCAL_EMBEDDING_BASE_URL", "")
+os.environ.setdefault("VOYAGE_API_KEY", "pa-test-key")
+os.environ.setdefault("VOYAGE_EMBED_BASE_URL", "http://voyage.test/v1")
+os.environ.setdefault("VOYAGE_RERANK_URL", "http://voyage.test/v1/rerank")
 os.environ.setdefault("CHAT_QDRANT_URL", "")
 
 BASELINES_DIR = Path(__file__).parent / "baselines"

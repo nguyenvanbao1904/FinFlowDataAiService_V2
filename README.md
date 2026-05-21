@@ -43,7 +43,7 @@ app/
 ├── services/
 │   ├── analytics_service.py        # Analytics insights generation
 │   ├── prefill_service.py          # Transaction prefill via LLM
-│   ├── forecast_service.py         # ML forecast with on-demand subprocess
+│   ├── forecast_service.py         # ML forecast per request (no persistent cache)
 │   └── chat/
 │       ├── orchestrator.py         # ReAct agent loop (max 6 iterations)
 │       ├── tool_registry.py        # 19 tool definitions (single source of truth)
@@ -76,7 +76,8 @@ scripts/financial_training/         # Offline pipelines (model training, RAG ind
 
 ## API Endpoints
 
-All endpoints (except `/` and `/health`) require header `X-Internal-Api-Key` when `INTERNAL_API_KEY` is configured.
+All endpoints (except `/` and `/health`) require header `X-Internal-Api-Key`.
+In production, the service fails closed when `INTERNAL_API_KEY` is missing; only `ENVIRONMENT=local|development|test` may bypass this for local development.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -150,6 +151,7 @@ Tóm tắt context cuộc hội thoại để duy trì continuity giữa các l�
 |----------|-------------|
 | `DEEPSEEK_API_KEY` | DeepSeek API key |
 | `INTERNAL_API_KEY` | Shared key với Spring Boot backend |
+| `ENVIRONMENT` | `production` by default; set `local` for local dev without internal auth |
 
 ### Core
 
@@ -164,9 +166,9 @@ Tóm tắt context cuộc hội thoại để duy trì continuity giữa các l�
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOCAL_EMBEDDING_BASE_URL` | | OpenAI-compatible embedding API URL |
-| `LOCAL_EMBEDDING_API_KEY` | `no-key-required` | Embedding API key |
-| `LOCAL_EMBEDDING_MODEL` | | Embedding model name |
+| `VOYAGE_API_KEY` | | Voyage API key for embedding/rerank |
+| `VOYAGE_EMBED_BASE_URL` | `https://api.voyageai.com/v1` | Voyage embedding API URL |
+| `VOYAGE_EMBED_MODEL` | `voyage-3.5-lite` | Embedding model name |
 
 ### Prefill Behavior
 
@@ -182,20 +184,16 @@ Tóm tắt context cuộc hội thoại để duy trì continuity giữa các l�
 | `CHAT_RAG_ENABLED` | `true` | Bật/tắt RAG retrieval |
 | `CHAT_QDRANT_URL` | `http://127.0.0.1:6333` | Qdrant vector DB URL |
 | `CHAT_QDRANT_API_KEY` | | Qdrant API key (nếu có auth) |
-| `CHAT_QDRANT_COLLECTION` | `annual_report_chunks_bge_m3` | Qdrant collection name |
+| `CHAT_QDRANT_COLLECTION` | `annual_report_chunks_voyage_3_5_lite` | Qdrant collection name |
 | `CHAT_RAG_CHUNKS_DB` | `artifacts/.../chunks.sqlite` | SQLite chunks DB path |
-| `CHAT_RAG_TOPK_VECTOR` | `6` | Top-K kết quả vector search |
-| `CHAT_RAG_TOPK_KEYWORD` | `6` | Top-K kết quả keyword search |
-| `CHAT_RAG_TOPK_FINAL` | `6` | Top-K kết quả cuối cùng (sau merge) |
+| `CHAT_RAG_TOPK_VECTOR` | `50` | Top-K kết quả vector search |
+| `CHAT_RAG_TOPK_KEYWORD` | `50` | Top-K kết quả keyword search |
+| `CHAT_RAG_TOPK_FINAL` | `5` | Top-K kết quả cuối cùng (sau rerank) |
 | `CHAT_TOOL_TIMEOUT_SECONDS` | `30` | Timeout cho tool calls |
 | `CHAT_FORECAST_ENABLED` | `true` | Bật/tắt ML forecast tool |
-| `CHAT_FORECAST_ON_DEMAND_ENABLED` | `true` | Bật/tắt on-demand forecast subprocess |
-| `CHAT_FORECAST_ON_DEMAND_TIMEOUT_SECONDS` | `180` | Timeout cho on-demand forecast |
-| `CHAT_FORECAST_ON_DEMAND_SCRIPT` | `scripts/.../test_final_models_forecast.py` | Path tới forecast script |
-| `CHAT_FORECAST_ON_DEMAND_OUTPUT_DIR` | `artifacts/.../production_pipeline/on_demand` | Output dir cho on-demand forecast |
-| `CHAT_FORECAST_REPORT_TABLE_CSV` | `artifacts/.../production_pipeline/report_table.csv` | Pre-computed forecast report |
-| `CHAT_FORECAST_DETAIL_CSV` | `artifacts/.../production_pipeline/predict_detail.csv` | Forecast detail CSV |
 | `CHAT_FORECAST_SUMMARY_JSON` | `artifacts/.../production_pipeline/summary.json` | Forecast summary metadata |
+| `CHAT_FORECAST_SCRIPT` | `scripts/.../test_final_models_forecast.py` | Path tới forecast script |
+| `CHAT_FORECAST_TIMEOUT_SECONDS` | `180` | Timeout cho mỗi request forecast |
 | `CHAT_FORECAST_TOP_FACTORS` | `5` | Số top factors hiển thị trong forecast |
 | `CHAT_DEBUG_LOG_PROMPTS` | `false` | Log prompts/responses (dev only) |
 | `CHAT_DEBUG_LOG_MAX_CHARS` | `8000` | Max chars khi log prompt/response |
@@ -249,7 +247,7 @@ Hệ thống dùng **2 pipeline** riêng biệt, mỗi pipeline gồm 4 XGBoost 
 | Pipeline | Train data | Predict | Mục đích |
 |----------|-----------|---------|----------|
 | **`eval_pipeline`** | → 2024 | 2025 | Đánh giá chất lượng model (so sánh dự báo 2025 vs số liệu thực 2025) |
-| **`production_pipeline`** | → 2025 | 2026 | Chatbot dùng để dự báo cho user. Cũng hỗ trợ on-demand forecast multi-year |
+| **`production_pipeline`** | → 2025 | 2026 | Chatbot dùng 4 model `.joblib` để dự báo theo request |
 
 **Chatbot chỉ đọc `production_pipeline`** — config trong `app/core/config.py` (các biến `CHAT_FORECAST_*`) trỏ vào thư mục này.
 
@@ -300,7 +298,7 @@ python scripts/financial_training/run_final_model_pipeline.py \
 ```
 
 Output walk-forward eval: `fold_metrics.csv`, `aggregate_metrics.csv`, `summary.json`, `report.md`, kèm từng fold ở `fold_<year>/`.
-Output production pipeline: 4 `.joblib` models + `report_table.csv` + `predict_detail.csv` + `summary.json` + `report_style.md`.
+Output production pipeline cần cho runtime: 4 `.joblib` models + `summary.json`.
 
 Flags thường dùng:
 
@@ -329,7 +327,7 @@ Walk-forward eval dùng expanding window:
 
 Script tự tính metric cho 3 scope: `ALL`, `VN100`, `VN30` từ `predict_detail.csv` của từng fold. Có thể thêm `--reuse-existing` để chỉ aggregate lại các fold đã chạy.
 
-#### Bước 3: On-demand forecast (1 mã, nhiều năm)
+#### Bước 3: Runtime forecast (1 mã, nhiều năm)
 
 ```bash
 python scripts/financial_training/test_final_models_forecast.py \
@@ -338,7 +336,7 @@ python scripts/financial_training/test_final_models_forecast.py \
   --source db
 ```
 
-Chatbot tự gọi script này khi user hỏi forecast cho mã không có sẵn trong `report_table.csv`. Kết quả cache vào `production_pipeline/on_demand/`.
+Chatbot gọi script này khi user hỏi forecast. `forecast_service.py` ghi output vào thư mục tạm, đọc kết quả, rồi xóa ngay; runtime không cache file trong `artifacts/`.
 
 Flags: `--base-year 2025`, `--predict-target revenue|profit|both`, `--history-mode recursive|use-actual-when-available`, `--top-features 8`.
 
@@ -359,11 +357,12 @@ artifacts/
     │   ├── aggregate_metrics.csv
     │   ├── summary.json
     │   └── report.md
-    └── production_pipeline/            # Chatbot dùng (train→2025, predict→2026)
-        ├── (same 4 .joblib + 4 reports)
-        └── on_demand/                  # Cache on-demand forecasts
-            ├── forecast_ACB_2025_2030.csv
-            └── forecast_ACB_2025_2030_feature_drivers.csv
+    └── production_pipeline/            # Chatbot dùng
+        ├── bank_revenue_next.joblib
+        ├── bank_profit_after_tax_next.joblib
+        ├── nonbank_revenue_next.joblib
+        ├── nonbank_profit_after_tax_next.joblib
+        └── summary.json
 ```
 
 ### Annual Report RAG Chunking
@@ -380,17 +379,17 @@ Flags: `--min-chars 300`, `--max-chars 2400`, `--ocr-image-only`, `--ocr-backend
 ### Full RAG Pipeline (Crawl -> Chunk -> Index)
 
 ```bash
-# Pull all symbols from DB, run full pipeline
+# Pull all symbols from DB, run full pipeline from VietstockFinance
 python scripts/financial_training/run_annual_report_rag_pipeline_from_db.py \
-  --cafef-years 5
+  --report-years 5
 
 # Storage-safe streaming mode
 python scripts/financial_training/run_annual_report_rag_pipeline_from_db.py \
-  --cafef-years 5 --streaming --delete-pdf-after-chunk
+  --report-years 5 --streaming --delete-pdf-after-chunk
 
 # With SQLite checkpoint + local LLM repair
 python scripts/financial_training/run_annual_report_rag_pipeline_from_db.py \
-  --cafef-years 5 --streaming --delete-pdf-after-chunk \
+  --report-years 5 --streaming --delete-pdf-after-chunk \
   --checkpoint-backend sqlite \
   --output-chunks-db artifacts/rag/annual_reports/chunks/annual_reports_chunks.sqlite \
   --llm-repair-garbled-chunks
@@ -398,7 +397,7 @@ python scripts/financial_training/run_annual_report_rag_pipeline_from_db.py \
 # Symbol-shard workers (parallel)
 python scripts/financial_training/run_annual_report_rag_pipeline_from_db.py \
   --worker-mode symbol-shard-partition --shard-count 8 \
-  --cafef-years 5 --streaming --delete-pdf-after-chunk \
+  --report-years 5 --streaming --delete-pdf-after-chunk \
   --checkpoint-backend sqlite --reset-output \
   --output-chunks-db artifacts/rag/annual_reports/chunks/annual_reports_chunks.sqlite
 ```
@@ -407,27 +406,14 @@ Key flags: `--skip-crawl`, `--parser-backend kreuzberg|pymupdf`, `--exchange-fil
 
 Outputs: raw PDFs, crawl manifest, chunks SQLite/JSON with FTS5 BM25 keyword index, per-worker shard DBs.
 
-### Embeddings (MLX BGE-M3)
+### Embeddings (Voyage + Qdrant)
 
 ```bash
-# Embed + upsert to Qdrant
-python scripts/financial_training/embed_annual_reports_chunks_mlx.py \
-  --chunks-db artifacts/rag/annual_reports/chunks/annual_reports_chunks.sqlite \
-  --output-db artifacts/rag/annual_reports/embeddings/annual_reports_embeddings.sqlite \
-  --embed-model mlx-community/bge-m3-mlx-fp16 \
-  --batch-size 16 \
-  --qdrant-upsert \
-  --qdrant-url http://127.0.0.1:6333 \
-  --qdrant-collection annual_report_chunks_bge_m3
-
-# Direct local MLX (no API server needed)
-python scripts/financial_training/embed_annual_reports_chunks_mlx.py \
-  --embed-mode mlx-local \
-  --embed-model mlx-community/bge-m3-mlx-fp16 \
-  --batch-size 16 --qdrant-upsert
+VOYAGE_EMBED_BATCH_SIZE=128 \
+bash scripts/financial_training/build_voyage_embedding_qdrant.sh --qdrant-recreate-collection
 ```
 
-Flags: `--rebuild-model`, `--limit 1000`, `--sleep-ms 50`, `--qdrant-recreate-collection`, `--embed-mode http|mlx-local`.
+Flags: `--rebuild-model`, `--limit 1000`, `--qdrant-recreate-collection`, `--qdrant-collection`.
 
 ## Caching Note
 

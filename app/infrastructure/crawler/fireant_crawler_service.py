@@ -50,9 +50,17 @@ class FireAntCrawlerService:
     Each ``get_*`` method returns ``(list[Model], list[str_warnings])``.
     """
 
+    def __init__(self) -> None:
+        self._quarters_cache: dict[str, list[dict[str, Any]]] = {}
+
     def _fetch_quarters(self, symbol: str) -> list[dict[str, Any]]:
+        cache_key = symbol.strip().upper()
+        if cache_key in self._quarters_cache:
+            return self._quarters_cache[cache_key]
+
         data = fetch_financial_data(symbol, report_type="Q", count=100)
         if not data:
+            self._quarters_cache[cache_key] = []
             return []
         # FireAnt occasionally emits stray legacy rows (e.g. ACB year=1990) that
         # predate the Vietnamese stock market (HOSE opened mid-2000). Drop any
@@ -70,6 +78,7 @@ class FireAntCrawlerService:
             if y_int and y_int < MIN_VALID_YEAR:
                 continue
             cleaned.append(d)
+        self._quarters_cache[cache_key] = cleaned
         return cleaned
 
     # ------------------------------------------------------------------

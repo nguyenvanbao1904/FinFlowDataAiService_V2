@@ -31,6 +31,35 @@ python -m evals.run_chat_eval --case investment_basic
 python -m evals.run_chat_eval --report out.md
 ```
 
+## RAGAS Benchmark
+
+Run the production annual-report RAG benchmark with the current best combo:
+
+- Embedding: `voyage-3.5-lite`
+- Rerank: `rerank-2.5-lite`
+- Retrieval: Qdrant vector search + SQLite FTS/BM25
+- Metrics: Faithfulness, Answer Relevancy, Context Precision, Context Recall
+
+```bash
+# Default: 50 generated questions
+evals/run_rag_ragas
+
+# Run exactly 30 or 50 questions
+evals/run_rag_ragas 30
+evals/run_rag_ragas 50
+
+# Reuse a fixed testset for reproducible comparisons
+evals/run_rag_ragas 50 --testset artifacts/rag_eval/ragas/<run-id>/testset.json
+```
+
+Outputs are saved to `artifacts/rag_eval/ragas/<timestamp>/`:
+
+- `summary.json`
+- `scores.csv`
+- `testset.json`
+- `ragas_dataset.json`
+- `rag_outputs.json`
+
 ## Adding a case
 
 Edit `datasets/chat_golden.yaml`:

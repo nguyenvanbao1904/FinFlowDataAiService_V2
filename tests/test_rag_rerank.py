@@ -1,8 +1,4 @@
-"""Verify rerank wiring in RagRetrievalService.
-
-Mocks both the local embedding endpoint, Qdrant search and the rerank
-endpoint to avoid needing a real MLX server in unit tests.
-"""
+"""Verify Voyage rerank wiring in RagRetrievalService."""
 from __future__ import annotations
 
 import json
@@ -14,16 +10,20 @@ import httpx
 
 @pytest.fixture
 def rag_env(monkeypatch):
-    """Configure settings so retrieve() uses the local mock URLs."""
+    """Configure settings so retrieve() uses mocked Voyage URLs."""
     from app.core.config import settings
-    monkeypatch.setattr(settings, "LOCAL_EMBEDDING_BASE_URL", "http://embed.test/v1")
-    monkeypatch.setattr(settings, "LOCAL_EMBEDDING_MODEL", "bge-m3-test")
+    monkeypatch.setattr(settings, "VOYAGE_API_KEY", "pa-test-key")
+    monkeypatch.setattr(settings, "VOYAGE_EMBED_BASE_URL", "http://voyage.test/v1")
+    monkeypatch.setattr(settings, "VOYAGE_EMBED_MODEL", "voyage-3.5-lite")
+    monkeypatch.setattr(settings, "VOYAGE_EMBED_INPUT_TYPE", "query")
+    monkeypatch.setattr(settings, "VOYAGE_RERANK_URL", "http://voyage.test/v1/rerank")
+    monkeypatch.setattr(settings, "VOYAGE_RERANK_MODEL", "rerank-2.5-lite")
     monkeypatch.setattr(settings, "CHAT_QDRANT_URL", "http://qdrant.test")
     monkeypatch.setattr(settings, "CHAT_QDRANT_COLLECTION", "test")
     monkeypatch.setattr(settings, "CHAT_RAG_CHUNKS_DB", "/dev/null/missing.sqlite")
     monkeypatch.setattr(settings, "CHAT_RAG_RERANK_ENABLED", True)
-    monkeypatch.setattr(settings, "CHAT_RAG_RERANK_URL", "http://rerank.test/v1/rerank")
-    monkeypatch.setattr(settings, "CHAT_RAG_RERANK_CANDIDATES", 30)
+    monkeypatch.setattr(settings, "CHAT_RAG_RERANK_CANDIDATES", 64)
+    monkeypatch.setattr(settings, "CHAT_RAG_TOPK_FINAL", 5)
 
 
 def _mock_embed_handler(request):
@@ -72,19 +72,20 @@ async def test_rerank_reorders_candidates(rag_env):
             {"index": i, "relevance_score": float(i) / n_docs, "document": {"text": body["documents"][i]}}
             for i in reversed(range(n_docs))
         ]
-        top_n = body.get("top_n") or n_docs
-        return httpx.Response(200, json={"results": results[:top_n], "model": "test"})
+        top_k = body.get("top_k") or n_docs
+        return httpx.Response(200, json={"data": results[:top_k], "model": "test"})
 
     with respx.mock(assert_all_called=False) as m:
-        m.post("http://rerank.test/v1/rerank").mock(side_effect=rerank_handler)
+        m.post("http://voyage.test/v1/rerank").mock(side_effect=rerank_handler)
         result = await service.retrieve(query="chiến lược kinh doanh", ticker="HPG")
 
-    assert len(result) == 6
+    assert len(result) == 5
     # Rerank reverses, so c9 should be first.
     assert result[0]["chunk_id"] == "c9"
-    assert result[-1]["chunk_id"] == "c4"
+    assert result[-1]["chunk_id"] == "c5"
     # Rerank score is preserved.
     assert "rerank_score" in result[0]
+    assert result[0]["rerank_provider"] == "voyage"
     assert result[0]["rerank_score"] > result[-1]["rerank_score"]
 
 
@@ -108,11 +109,11 @@ async def test_rerank_failure_falls_back_to_rrf(rag_env, monkeypatch):
     service._load_chunk_details = fake_load_details  # type: ignore
 
     with respx.mock(assert_all_called=False) as m:
-        m.post("http://rerank.test/v1/rerank").mock(return_value=httpx.Response(503))
+        m.post("http://voyage.test/v1/rerank").mock(return_value=httpx.Response(503))
         result = await service.retrieve(query="rủi ro", ticker="VCB")
 
     # Falls back to RRF order.
-    assert len(result) == 6
+    assert len(result) == 5
     assert result[0]["chunk_id"] == "c0"  # RRF preserves the highest-RRF item
 
 
@@ -138,7 +139,7 @@ async def test_rerank_disabled_skips_endpoint(rag_env, monkeypatch):
     service._load_chunk_details = fake_load_details  # type: ignore
 
     with respx.mock(assert_all_called=False) as m:
-        rerank_route = m.post("http://rerank.test/v1/rerank").mock(
+        rerank_route = m.post("http://voyage.test/v1/rerank").mock(
             return_value=httpx.Response(200, json={"results": []})
         )
         result = await service.retrieve(query="x", ticker="HPG")

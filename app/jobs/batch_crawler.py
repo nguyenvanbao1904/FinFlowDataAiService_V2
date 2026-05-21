@@ -4,8 +4,10 @@ import time
 import os
 import asyncio
 from pathlib import Path
+from datetime import datetime
 
 from dotenv import load_dotenv
+import pymysql
 
 load_dotenv()
 
@@ -33,6 +35,7 @@ FAILED_REPORT_FILE = STATE_DIR / "failed_report.json"
 MAX_WORKERS = 8
 RETRY_MAX = 3
 SAFE_DELAY = 0.5
+REFRESH_RECENT_YEARS = int(os.getenv("CRAWLER_REFRESH_RECENT_YEARS", "1"))
 
 
 def load_state():
@@ -49,11 +52,68 @@ def save_state(state):
             json.dump(state, f, ensure_ascii=False, indent=4)
 
 
+def _mysql_connection():
+    return pymysql.connect(
+        host=settings.MYSQL_HOST,
+        port=int(settings.MYSQL_PORT),
+        user=settings.MYSQL_USER,
+        password=settings.MYSQL_PASSWORD,
+        database=settings.MYSQL_DATABASE,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def _load_existing_periods(symbol: str) -> dict[str, set[tuple[int, int]]]:
+    symbol = symbol.upper()
+    queries = {
+        "indicators": "SELECT year, quarter FROM financial_indicators WHERE company_id = %s",
+        "income": "SELECT year, quarter FROM income_statements WHERE company_id = %s",
+        "balance": "SELECT year, quarter FROM balance_sheets WHERE company_id = %s",
+        "cashflow": "SELECT year, quarter FROM cash_flow_statements WHERE company_id = %s",
+    }
+    out: dict[str, set[tuple[int, int]]] = {key: set() for key in queries}
+    try:
+        with _mysql_connection() as conn:
+            with conn.cursor() as cur:
+                for key, sql in queries.items():
+                    cur.execute(sql, (symbol,))
+                    for row in cur.fetchall():
+                        try:
+                            out[key].add((int(row["year"]), int(row["quarter"])))
+                        except Exception:
+                            continue
+    except Exception as exc:
+        logger.warning("[%s] cannot load existing DB periods, fallback to full push: %s", symbol, exc)
+        return {key: set() for key in queries}
+    return out
+
+
+def _filter_incremental_periods(rows, existing_periods: set[tuple[int, int]], *, refresh_recent_years: int):
+    if not rows:
+        return []
+    current_year = datetime.now().year
+    refresh_from_year = current_year - max(0, int(refresh_recent_years))
+    filtered = []
+    for row in rows:
+        year = getattr(row, "year", None)
+        quarter = getattr(row, "quarter", None)
+        try:
+            key = (int(year), int(quarter))
+        except Exception:
+            filtered.append(row)
+            continue
+        if key not in existing_periods or key[0] >= refresh_from_year:
+            filtered.append(row)
+    return filtered
+
+
 def run_crawler_for_symbol(sym_data: tuple):
     """Crawl + push financial data for a single symbol."""
     symbol, is_bank, exchange_group = sym_data
     crawler = FireAntCrawlerService()
     errors = []
+    existing_periods = _load_existing_periods(symbol)
 
     debug_symbols_env = os.getenv("DEBUG_COMPANY_META_SYMBOLS", "")
     debug_symbols = (
@@ -77,21 +137,56 @@ def run_crawler_for_symbol(sym_data: tuple):
 
     # 1. Indicators
     inds, w_inds = safe_request(crawler.get_financial_indicators, symbol, is_bank)
-    if not inds:
+    raw_inds_count = len(inds)
+    inds = _filter_incremental_periods(
+        inds,
+        existing_periods["indicators"],
+        refresh_recent_years=REFRESH_RECENT_YEARS,
+    )
+    if raw_inds_count == 0:
         errors.append(f"Indicators failed: {w_inds}")
 
     # 2. Income Statement
     incomes, w_inc = safe_request(crawler.get_income_statement, symbol, is_bank)
-    if not incomes:
+    raw_incomes_count = len(incomes)
+    incomes = _filter_incremental_periods(
+        incomes,
+        existing_periods["income"],
+        refresh_recent_years=REFRESH_RECENT_YEARS,
+    )
+    if raw_incomes_count == 0:
         errors.append(f"Income failed: {w_inc}")
 
     # 3. Balance Sheet
     balances, w_bal = safe_request(crawler.get_balance_sheet, symbol, is_bank)
-    if not balances:
+    raw_balances_count = len(balances)
+    balances = _filter_incremental_periods(
+        balances,
+        existing_periods["balance"],
+        refresh_recent_years=REFRESH_RECENT_YEARS,
+    )
+    if raw_balances_count == 0:
         errors.append(f"Balance failed: {w_bal}")
 
     # 4. Cash Flow (optional — many small companies have none)
     cashflows, w_cf = safe_request(crawler.get_cash_flow_statements, symbol)
+    cashflows = _filter_incremental_periods(
+        cashflows,
+        existing_periods["cashflow"],
+        refresh_recent_years=REFRESH_RECENT_YEARS,
+    )
+
+    logger.info(
+        "[%s] incremental payload sizes: indicators=%d/%d income=%d/%d balance=%d/%d cashflow=%d",
+        symbol,
+        len(inds),
+        raw_inds_count,
+        len(incomes),
+        raw_incomes_count,
+        len(balances),
+        raw_balances_count,
+        len(cashflows),
+    )
 
     # 5. Shareholders
     shareholders, w_sh = safe_request(crawler.get_company_shareholders, symbol)
@@ -282,10 +377,11 @@ def run_batch_crawl():
     state = load_state()
     successful_list = state.get("successful", [])
 
-    pending_symbols = [s for s in symbols_to_crawl if s[0] not in successful_list]
+    skip_successful = os.getenv("CRAWLER_SKIP_SUCCESSFUL", "false").strip().lower() in {"1", "true", "yes"}
+    pending_symbols = [s for s in symbols_to_crawl if (not skip_successful or s[0] not in successful_list)]
     logger.info(
-        "Total: %d. Done: %d. Pending: %d",
-        len(symbols_to_crawl), len(successful_list), len(pending_symbols),
+        "Total: %d. Previously successful: %d. Pending this run: %d. skip_successful=%s refresh_recent_years=%d",
+        len(symbols_to_crawl), len(successful_list), len(pending_symbols), skip_successful, REFRESH_RECENT_YEARS,
     )
 
     if not pending_symbols:
@@ -304,7 +400,8 @@ def run_batch_crawl():
             try:
                 sym, success, errors = future.result()
                 if success:
-                    state["successful"].append(sym)
+                    if sym not in state["successful"]:
+                        state["successful"].append(sym)
                     save_state(state)
                 else:
                     failed_report[sym] = errors

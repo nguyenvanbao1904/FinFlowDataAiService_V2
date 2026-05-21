@@ -5,6 +5,7 @@ import logging
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -19,13 +20,9 @@ logger = logging.getLogger(__name__)
 class ForecastToolService:
     def __init__(self) -> None:
         self.enabled = bool(settings.CHAT_FORECAST_ENABLED)
-        self.report_table_csv = Path(settings.CHAT_FORECAST_REPORT_TABLE_CSV)
-        self.detail_csv = Path(settings.CHAT_FORECAST_DETAIL_CSV)
         self.summary_json = Path(settings.CHAT_FORECAST_SUMMARY_JSON)
-        self.on_demand_enabled = bool(settings.CHAT_FORECAST_ON_DEMAND_ENABLED)
-        self.on_demand_script = Path(settings.CHAT_FORECAST_ON_DEMAND_SCRIPT)
-        self.on_demand_output_dir = Path(settings.CHAT_FORECAST_ON_DEMAND_OUTPUT_DIR)
-        self.on_demand_timeout = max(30, int(settings.CHAT_FORECAST_ON_DEMAND_TIMEOUT_SECONDS))
+        self.forecast_script = Path(settings.CHAT_FORECAST_SCRIPT)
+        self.forecast_timeout = max(30, int(settings.CHAT_FORECAST_TIMEOUT_SECONDS))
         self.top_factors = max(1, int(settings.CHAT_FORECAST_TOP_FACTORS))
 
     def get_company_forecast(self, symbol: str, target_year: int | None = None) -> dict[str, Any]:
@@ -48,67 +45,19 @@ class ForecastToolService:
         else:
             effective_year = default_year
 
-        forecast_rows, source_ref, load_error = self._load_forecast_rows()
-        if not forecast_rows:
-            on_demand_row, on_demand_ref, on_demand_err = self._run_on_demand_forecast(
-                symbol=normalized_symbol,
-                target_year=effective_year,
-            )
-            if on_demand_row:
-                return self._build_success_payload(
-                    symbol=normalized_symbol,
-                    effective_year=effective_year,
-                    item=on_demand_row,
-                    summary_payload=summary_payload,
-                    source_ref=on_demand_ref,
-                    model_version="production_pipeline_v1_on_demand",
-                )
-            missing_symbols = self._extract_missing_symbols(summary_payload)
-            if missing_symbols:
-                suffix = f"; on_demand_error={on_demand_err}" if on_demand_err else ""
-                return self._error(
-                    "FORECAST_NO_PREDICTIONS",
-                    f"No forecast rows produced by pipeline. missing_symbols={missing_symbols}{suffix}",
-                )
-            if load_error:
-                if on_demand_err:
-                    return self._error("FORECAST_REPORT_READ_FAILED", f"{load_error}; on_demand_error={on_demand_err}")
-                return self._error("FORECAST_REPORT_READ_FAILED", load_error)
-            return self._error(
-                "FORECAST_REPORT_EMPTY",
-                f"No usable forecast rows in report_table/detail csv; on_demand_error={on_demand_err}",
-            )
+        forecast_row, forecast_err = self._run_forecast(
+            symbol=normalized_symbol,
+            target_year=effective_year,
+        )
+        if not forecast_row:
+            return self._error("FORECAST_FAILED", forecast_err or "Forecast failed")
 
-        candidates = [row for row in forecast_rows if str(row.get("symbol", "")).upper() == normalized_symbol]
-        if not candidates:
-            on_demand_row, on_demand_ref, on_demand_err = self._run_on_demand_forecast(
-                symbol=normalized_symbol,
-                target_year=effective_year,
-            )
-            if on_demand_row:
-                return self._build_success_payload(
-                    symbol=normalized_symbol,
-                    effective_year=effective_year,
-                    item=on_demand_row,
-                    summary_payload=summary_payload,
-                    source_ref=on_demand_ref,
-                    model_version="production_pipeline_v1_on_demand",
-                )
-            if on_demand_err:
-                return self._error(
-                    "FORECAST_SYMBOL_NOT_FOUND",
-                    f"No forecast found for symbol {normalized_symbol}; on_demand_error={on_demand_err}",
-                )
-            return self._error("FORECAST_SYMBOL_NOT_FOUND", f"No forecast found for symbol {normalized_symbol}")
-
-        item = self._pick_best_row(candidates, effective_year)
         return self._build_success_payload(
             symbol=normalized_symbol,
             effective_year=effective_year,
-            item=item,
+            item=forecast_row,
             summary_payload=summary_payload,
-            source_ref=source_ref,
-            model_version="production_pipeline_v1",
+            model_version="production_pipeline_v1_runtime",
         )
 
     def _build_success_payload(
@@ -118,28 +67,17 @@ class ForecastToolService:
         effective_year: int | None,
         item: dict[str, Any],
         summary_payload: dict[str, Any],
-        source_ref: str | None,
         model_version: str,
     ) -> dict[str, Any]:
         quality = self._extract_quality(summary_payload)
         generated_at = self._extract_generated_at(summary_payload)
         assumptions = self._extract_assumptions(summary_payload)
         predict_year = int(effective_year) if isinstance(effective_year, int) else self._to_int(item.get("target_year"))
-        if model_version.endswith("_on_demand") and isinstance(predict_year, int):
+        if isinstance(predict_year, int):
             assumptions = dict(assumptions)
             assumptions["predict_target_year"] = predict_year
 
         top_factors = item.get("top_factors") if isinstance(item.get("top_factors"), dict) else {}
-        top_factors_ref = item.get("top_factors_source_ref") if isinstance(item.get("top_factors_source_ref"), str) else None
-        if not top_factors:
-            loaded_factors, loaded_ref = self._load_top_factors_from_source(
-                source_ref=source_ref,
-                symbol=symbol,
-                target_year=predict_year,
-            )
-            if loaded_factors:
-                top_factors = loaded_factors
-                top_factors_ref = loaded_ref
 
         data = {
             "symbol": symbol,
@@ -155,17 +93,12 @@ class ForecastToolService:
             "assumptions": assumptions,
             "top_factors": top_factors,
         }
-        refs: list[str] = []
-        if source_ref:
-            refs.append(source_ref)
-        if top_factors_ref and top_factors_ref not in refs:
-            refs.append(top_factors_ref)
         return {
             "ok": True,
             "data": data,
             "error_code": None,
             "error_message": None,
-            "source_refs": refs,
+            "source_refs": [],
         }
 
     def _read_summary_json(self) -> dict[str, Any]:
@@ -236,49 +169,23 @@ class ForecastToolService:
         value = config.get("generated_at") or config.get("generatedAt")
         return str(value).strip() if isinstance(value, str) and value.strip() else None
 
-    @staticmethod
-    def _extract_missing_symbols(summary_payload: dict[str, Any]) -> list[str]:
-        value = summary_payload.get("missing_symbols")
-        if not isinstance(value, list):
-            return []
-        out: list[str] = []
-        for item in value:
-            if isinstance(item, str) and item.strip():
-                out.append(item.strip().upper())
-        return out
-
-    def _load_forecast_rows(self) -> tuple[list[dict[str, Any]], str | None, str | None]:
-        report_rows, report_err = self._read_report_table_rows()
-        if report_rows:
-            return report_rows, str(self.report_table_csv), None
-
-        detail_rows, detail_err = self._read_predict_detail_rows()
-        if detail_rows:
-            return detail_rows, str(self.detail_csv), None
-
-        err = report_err or detail_err
-        return [], None, err
-
-    def _run_on_demand_forecast(
+    def _run_forecast(
         self,
         *,
         symbol: str,
         target_year: int | None,
-    ) -> tuple[dict[str, Any] | None, str | None, str | None]:
-        if not self.on_demand_enabled:
-            return None, None, "on_demand_disabled"
+    ) -> tuple[dict[str, Any] | None, str | None]:
         if target_year is None:
-            return None, None, "missing_target_year"
-        if not self.on_demand_script.exists():
-            return None, None, f"missing_script:{self.on_demand_script}"
+            return None, "missing_target_year"
+        if not self.forecast_script.exists():
+            return None, f"missing_script:{self.forecast_script}"
 
-        self.on_demand_output_dir.mkdir(parents=True, exist_ok=True)
-        out_csv = self.on_demand_output_dir / f"forecast_{symbol}_{target_year}.csv"
-
-        if not out_csv.exists():
+        with tempfile.TemporaryDirectory(prefix="finflow_forecast_") as tmp:
+            tmp_dir = Path(tmp)
+            out_csv = tmp_dir / f"forecast_{symbol}_{target_year}.csv"
             cmd = [
                 sys.executable,
-                str(self.on_demand_script),
+                str(self.forecast_script),
                 "--symbol",
                 symbol,
                 "--to-year",
@@ -293,103 +200,76 @@ class ForecastToolService:
                     check=True,
                     capture_output=True,
                     text=True,
-                    timeout=self.on_demand_timeout,
+                    timeout=self.forecast_timeout,
                 )
             except subprocess.TimeoutExpired:
-                return None, None, "on_demand_timeout"
+                return None, "forecast_timeout"
             except subprocess.CalledProcessError as exc:
                 stderr = (exc.stderr or "").strip()
                 stdout = (exc.stdout or "").strip()
                 detail = stderr or stdout or str(exc)
-                return None, None, f"on_demand_failed:{detail[:300]}"
+                return None, f"forecast_failed:{detail[:300]}"
             except Exception as exc:
-                return None, None, f"on_demand_failed:{type(exc).__name__}:{exc}"
+                return None, f"forecast_failed:{type(exc).__name__}:{exc}"
 
-        try:
-            df = pd.read_csv(out_csv)
-        except Exception as exc:
-            return None, None, f"on_demand_read_failed:{type(exc).__name__}:{exc}"
-        if df.empty:
-            return None, None, "on_demand_empty_output"
+            try:
+                df = pd.read_csv(out_csv)
+            except Exception as exc:
+                return None, f"forecast_read_failed:{type(exc).__name__}:{exc}"
+            if df.empty:
+                return None, "forecast_empty_output"
 
-        cols = {str(c).strip().lower(): c for c in df.columns}
-        for required in ("symbol", "year", "revenue", "profit_after_tax"):
-            if required not in cols:
-                return None, None, f"on_demand_missing_col:{required}"
+            cols = {str(c).strip().lower(): c for c in df.columns}
+            for required in ("symbol", "year", "revenue", "profit_after_tax"):
+                if required not in cols:
+                    return None, f"forecast_missing_col:{required}"
 
-        df = df.copy()
-        df["_symbol"] = df[cols["symbol"]].astype(str).str.upper().str.strip()
-        df["_year"] = pd.to_numeric(df[cols["year"]], errors="coerce")
-        df = df[(df["_symbol"] == symbol.upper()) & (df["_year"].notna())]
-        if df.empty:
-            return None, None, "on_demand_no_symbol_rows"
+            df = df.copy()
+            df["_symbol"] = df[cols["symbol"]].astype(str).str.upper().str.strip()
+            df["_year"] = pd.to_numeric(df[cols["year"]], errors="coerce")
+            df = df[(df["_symbol"] == symbol.upper()) & (df["_year"].notna())]
+            if df.empty:
+                return None, "forecast_no_symbol_rows"
 
-        target_rows = df[df["_year"] == int(target_year)]
-        if target_rows.empty:
-            target_rows = df.sort_values("_year").tail(1)
-        target = target_rows.iloc[-1]
+            target_rows = df[df["_year"] == int(target_year)]
+            if target_rows.empty:
+                target_rows = df.sort_values("_year").tail(1)
+            target = target_rows.iloc[-1]
 
-        base = target
-        source_col = cols.get("source")
-        if source_col and source_col in df.columns:
-            base_rows = df[df[source_col].astype(str).str.lower().eq("base")]
-            if not base_rows.empty:
-                base = base_rows.iloc[-1]
+            base = target
+            source_col = cols.get("source")
+            if source_col and source_col in df.columns:
+                base_rows = df[df[source_col].astype(str).str.lower().eq("base")]
+                if not base_rows.empty:
+                    base = base_rows.iloc[-1]
+                else:
+                    earlier = df[df["_year"] < int(target_year)]
+                    if not earlier.empty:
+                        base = earlier.sort_values("_year").iloc[-1]
             else:
                 earlier = df[df["_year"] < int(target_year)]
                 if not earlier.empty:
                     base = earlier.sort_values("_year").iloc[-1]
-        else:
-            earlier = df[df["_year"] < int(target_year)]
-            if not earlier.empty:
-                base = earlier.sort_values("_year").iloc[-1]
 
-        row = {
-            "symbol": symbol.upper(),
-            "target_year": int(float(target["_year"])),
-            "feature_year": int(float(base["_year"])) if base is not None else None,
-            "revenue_actual": self._to_float(base.get(cols["revenue"])) if base is not None else None,
-            "profit_actual": self._to_float(base.get(cols["profit_after_tax"])) if base is not None else None,
-            "revenue_pred": self._to_float(target.get(cols["revenue"])),
-            "profit_pred": self._to_float(target.get(cols["profit_after_tax"])),
-        }
-        explain_csv = out_csv.with_name(f"{out_csv.stem}_feature_drivers.csv")
-        top_factors = self._read_feature_drivers(
-            explain_csv,
-            symbol=symbol,
-            target_year=int(target_year),
-            top_k=self.top_factors,
-        )
-        if top_factors:
-            row["top_factors"] = top_factors
-            row["top_factors_source_ref"] = str(explain_csv)
-        return row, str(out_csv), None
-
-    def _load_top_factors_from_source(
-        self,
-        *,
-        source_ref: str | None,
-        symbol: str,
-        target_year: int | None,
-    ) -> tuple[dict[str, list[dict[str, Any]]], str | None]:
-        if not source_ref:
-            return {}, None
-        src = Path(source_ref)
-        candidates = [
-            src.with_name(f"{src.stem}_feature_drivers.csv"),
-            src.parent / "predict_detail_feature_drivers.csv",
-            src.parent / "report_table_feature_drivers.csv",
-        ]
-        for candidate in candidates:
-            factors = self._read_feature_drivers(
-                candidate,
+            row = {
+                "symbol": symbol.upper(),
+                "target_year": int(float(target["_year"])),
+                "feature_year": int(float(base["_year"])) if base is not None else None,
+                "revenue_actual": self._to_float(base.get(cols["revenue"])) if base is not None else None,
+                "profit_actual": self._to_float(base.get(cols["profit_after_tax"])) if base is not None else None,
+                "revenue_pred": self._to_float(target.get(cols["revenue"])),
+                "profit_pred": self._to_float(target.get(cols["profit_after_tax"])),
+            }
+            explain_csv = out_csv.with_name(f"{out_csv.stem}_feature_drivers.csv")
+            top_factors = self._read_feature_drivers(
+                explain_csv,
                 symbol=symbol,
-                target_year=target_year,
+                target_year=int(target_year),
                 top_k=self.top_factors,
             )
-            if factors:
-                return factors, str(candidate)
-        return {}, None
+            if top_factors:
+                row["top_factors"] = top_factors
+            return row, None
 
     def _read_feature_drivers(
         self,
@@ -519,111 +399,6 @@ class ForecastToolService:
                 it["rank"] = idx
             out[key] = trimmed
         return out
-
-    def _read_report_table_rows(self) -> tuple[list[dict[str, Any]], str | None]:
-        if not self.report_table_csv.exists():
-            return [], f"Missing report_table.csv at {self.report_table_csv}"
-        try:
-            df = pd.read_csv(self.report_table_csv)
-        except Exception as exc:
-            return [], f"{type(exc).__name__}: {exc}"
-        if df.empty:
-            return [], "report_table.csv has no data rows"
-
-        columns = {str(c).strip().lower(): c for c in df.columns}
-        symbol_col = columns.get("symbol")
-        rev_pred_col = columns.get("revenue_pred")
-        prof_pred_col = columns.get("profit_pred")
-        if not symbol_col or not rev_pred_col or not prof_pred_col:
-            return [], f"report_table.csv missing required columns. columns={list(df.columns)}"
-
-        feature_year_col = columns.get("feature_year")
-        target_year_col = columns.get("target_year") or columns.get("predict_target_year")
-        rev_actual_col = columns.get("revenue_actual")
-        prof_actual_col = columns.get("profit_actual")
-
-        rows: list[dict[str, Any]] = []
-        for _, row in df.iterrows():
-            symbol = str(row.get(symbol_col, "")).strip().upper()
-            if not symbol:
-                continue
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "feature_year": self._to_int(row.get(feature_year_col)) if feature_year_col else None,
-                    "target_year": self._to_int(row.get(target_year_col)) if target_year_col else None,
-                    "revenue_actual": self._to_float(row.get(rev_actual_col)) if rev_actual_col else None,
-                    "profit_actual": self._to_float(row.get(prof_actual_col)) if prof_actual_col else None,
-                    "revenue_pred": self._to_float(row.get(rev_pred_col)),
-                    "profit_pred": self._to_float(row.get(prof_pred_col)),
-                }
-            )
-        return rows, None
-
-    def _read_predict_detail_rows(self) -> tuple[list[dict[str, Any]], str | None]:
-        if not self.detail_csv.exists():
-            return [], f"Missing predict_detail.csv at {self.detail_csv}"
-        try:
-            df = pd.read_csv(self.detail_csv)
-        except Exception as exc:
-            return [], f"{type(exc).__name__}: {exc}"
-        if df.empty:
-            return [], "predict_detail.csv has no data rows"
-
-        columns = {str(c).strip().lower(): c for c in df.columns}
-        required = ("symbol", "target", "target_year", "predicted")
-        missing = [col for col in required if col not in columns]
-        if missing:
-            return [], f"predict_detail.csv missing required columns={missing}. columns={list(df.columns)}"
-
-        grouped: dict[tuple[str, int], dict[str, Any]] = {}
-        for _, row in df.iterrows():
-            symbol = str(row.get(columns["symbol"], "")).strip().upper()
-            target = str(row.get(columns["target"], "")).strip().lower()
-            target_year = self._to_int(row.get(columns["target_year"]))
-            if not symbol or target_year is None:
-                continue
-            key = (symbol, target_year)
-            item = grouped.setdefault(
-                key,
-                {
-                    "symbol": symbol,
-                    "feature_year": self._to_int(row.get(columns.get("feature_year"))) if columns.get("feature_year") else None,
-                    "target_year": target_year,
-                    "revenue_actual": None,
-                    "profit_actual": None,
-                    "revenue_pred": None,
-                    "profit_pred": None,
-                },
-            )
-
-            predicted = self._to_float(row.get(columns["predicted"]))
-            actual = self._to_float(row.get(columns["actual"])) if columns.get("actual") else None
-            if "revenue" in target:
-                item["revenue_pred"] = predicted
-                if actual is not None:
-                    item["revenue_actual"] = actual
-            elif "profit" in target:
-                item["profit_pred"] = predicted
-                if actual is not None:
-                    item["profit_actual"] = actual
-
-        rows = [value for value in grouped.values() if value.get("revenue_pred") is not None or value.get("profit_pred") is not None]
-        return rows, None
-
-    @staticmethod
-    def _pick_best_row(rows: list[dict[str, Any]], target_year: int | None) -> dict[str, Any]:
-        if not rows:
-            return {}
-        if target_year is not None:
-            exact = [row for row in rows if row.get("target_year") == target_year]
-            if exact:
-                return exact[-1]
-        with_year = [row for row in rows if isinstance(row.get("target_year"), int)]
-        if with_year:
-            with_year.sort(key=lambda item: int(item.get("target_year") or 0))
-            return with_year[-1]
-        return rows[-1]
 
     _to_int = staticmethod(as_int)
     _to_float = staticmethod(as_float)

@@ -214,17 +214,16 @@ agent_tools.search_annual_reports(ticker, query)
    └─ RagRetrievalService.retrieve(query, ticker, years)
         ├─ asyncio.gather:
         │    ├─ vector_search:
-        │    │    ├─ embed query qua local MLX server (bge-m3, port 9091)
-        │    │    └─ Qdrant query (top 25) với filter ticker + năm
+        │    │    ├─ embed query qua Voyage (voyage-3.5-lite)
+        │    │    └─ Qdrant query (top 50) với filter ticker + năm
         │    └─ keyword_search:
-        │         └─ SQLite full-text (top 25) trên chunks DB
-        ├─ RRF merge (Reciprocal Rank Fusion) → top 30 candidates
+        │         └─ SQLite full-text (top 50) trên chunks DB
+        ├─ RRF merge (Reciprocal Rank Fusion) → top 64 candidates
         ├─ Load chunk text từ SQLite
         └─ Rerank (nếu CHAT_RAG_RERANK_ENABLED=true):
-             ├─ POST /v1/rerank với (query, 30 documents)
-             ├─ bge-reranker-v2-m3 cross-encoder trên Apple MPS
-             ├─ Re-score 30 cặp (query, chunk) → sort theo relevance
-             └─ Trả top 6 (precision +20-30% vs RRF only)
+             ├─ POST /v1/rerank qua Voyage rerank-2.5-lite
+             ├─ Re-score candidates theo relevance
+             └─ Trả top 5 chunks cho LLM
    └─ Return list[{chunk_id, source_title, page_number, text, rerank_score}]
 ```
 
