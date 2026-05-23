@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -877,9 +878,13 @@ class AnnualReportChunker:
                     if self._prefer_ocr_text(str(original_text), str(ocr_text)):
                         page_texts[page_idx] = str(ocr_text)
                         pages_with_ocr += 1
+                del page
+                if (page_idx + 1) % 10 == 0:
+                    gc.collect()
             return page_texts, pages_with_ocr
         finally:
             doc.close()
+            gc.collect()
 
     def _extract_pages(self, pdf_path: Path) -> tuple[list[str], int, int, int, str]:
         backend_label = self.parser_backend

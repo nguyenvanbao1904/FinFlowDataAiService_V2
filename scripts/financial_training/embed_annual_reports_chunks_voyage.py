@@ -300,6 +300,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-input-chars", type=int, default=3500)
     parser.add_argument(
+        "--target-year",
+        type=int,
+        default=0,
+        help="Only embed chunks for this report year. Default 0 scans all chunks.",
+    )
+    parser.add_argument(
         "--embed-input-type",
         type=str,
         default=os.getenv("VOYAGE_EMBED_INPUT_TYPE", "document"),
@@ -334,8 +340,9 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _chunk_rows_query() -> str:
-    return """
+def _chunk_rows_query(target_year: int = 0) -> str:
+    year_filter = "AND c.year = ?" if int(target_year or 0) > 0 else ""
+    return f"""
         SELECT
             c.chunk_id,
             c.stock_code,
@@ -352,6 +359,7 @@ def _chunk_rows_query() -> str:
             ON e.chunk_id = c.chunk_id
            AND e.model = ?
         WHERE c.chunk_id > ?
+        {year_filter}
         ORDER BY c.chunk_id ASC
         LIMIT ?
     """
@@ -365,6 +373,7 @@ def _collect_pending_rows(
     wanted: int,
     scan_limit: int,
     max_input_chars: int,
+    target_year: int = 0,
 ) -> tuple[list[tuple[Any, ...]], list[str], list[str], str, bool]:
     pending_rows: list[tuple[Any, ...]] = []
     pending_inputs: list[str] = []
@@ -373,7 +382,12 @@ def _collect_pending_rows(
     exhausted = False
 
     while len(pending_rows) < wanted:
-        rows = conn.execute(_chunk_rows_query(), (model, cursor_after, scan_limit)).fetchall()
+        params: tuple[Any, ...]
+        if int(target_year or 0) > 0:
+            params = (model, cursor_after, int(target_year), scan_limit)
+        else:
+            params = (model, cursor_after, scan_limit)
+        rows = conn.execute(_chunk_rows_query(target_year), params).fetchall()
         if not rows:
             exhausted = True
             break
@@ -404,11 +418,17 @@ def _count_pending_rows(
     model: str,
     max_input_chars: int,
     limit: int,
+    target_year: int = 0,
 ) -> int:
     total = 0
     last_chunk_id = ""
     while True:
-        rows = conn.execute(_chunk_rows_query(), (model, last_chunk_id, 1000)).fetchall()
+        params: tuple[Any, ...]
+        if int(target_year or 0) > 0:
+            params = (model, last_chunk_id, int(target_year), 1000)
+        else:
+            params = (model, last_chunk_id, 1000)
+        rows = conn.execute(_chunk_rows_query(target_year), params).fetchall()
         if not rows:
             break
         last_chunk_id = str(rows[-1][0] or last_chunk_id)
@@ -435,6 +455,7 @@ def main() -> int:
     max_input_chars = max(0, int(args.max_input_chars))
     embed_input_type = str(args.embed_input_type or "").strip().lower()
     sleep_ms = max(0, int(args.sleep_ms))
+    target_year = max(0, int(args.target_year or 0))
 
     if not chunks_db.exists():
         print(f"[EMBED][ERR] chunks_db_not_found={chunks_db}")
@@ -469,15 +490,27 @@ def main() -> int:
         _ensure_embeddings_schema(conn)
         conn.execute("ATTACH DATABASE ? AS chunks_db", (str(chunks_db),))
         try:
-            row = conn.execute("SELECT COUNT(*) FROM chunks_db.chunks").fetchone()
+            if target_year > 0:
+                row = conn.execute("SELECT COUNT(*) FROM chunks_db.chunks WHERE year = ?", (target_year,)).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM chunks_db.chunks").fetchone()
             total_chunks = int(row[0]) if row else 0
 
             if args.rebuild_model:
-                conn.execute("DELETE FROM embeddings WHERE model = ?", (model,))
+                if target_year > 0:
+                    conn.execute("DELETE FROM embeddings WHERE model = ? AND year = ?", (model, target_year))
+                else:
+                    conn.execute("DELETE FROM embeddings WHERE model = ?", (model,))
                 conn.commit()
-                print(f"[EMBED][RESET] removed_existing_model_rows model={model}")
+                print(f"[EMBED][RESET] removed_existing_model_rows model={model} target_year={target_year or 'all'}")
 
-            existing_row = conn.execute("SELECT COUNT(*) FROM embeddings WHERE model = ?", (model,)).fetchone()
+            if target_year > 0:
+                existing_row = conn.execute(
+                    "SELECT COUNT(*) FROM embeddings WHERE model = ? AND year = ?",
+                    (model, target_year),
+                ).fetchone()
+            else:
+                existing_row = conn.execute("SELECT COUNT(*) FROM embeddings WHERE model = ?", (model,)).fetchone()
             existing_for_model = int(existing_row[0]) if existing_row else 0
 
             pending_total = _count_pending_rows(
@@ -485,11 +518,12 @@ def main() -> int:
                 model=model,
                 max_input_chars=max_input_chars,
                 limit=max(0, int(args.limit)),
+                target_year=target_year,
             )
 
             print(
                 "[EMBED][START] "
-                f"model={model} total_chunks={total_chunks} existing_for_model={existing_for_model} pending={pending_total} "
+                f"model={model} target_year={target_year or 'all'} total_chunks={total_chunks} existing_for_model={existing_for_model} pending={pending_total} "
                 f"batch_size={batch_size} "
                 f"embed_base_url={str(args.embed_base_url)} output_db={output_db}"
             )
@@ -517,6 +551,7 @@ def main() -> int:
                     wanted=current_limit,
                     scan_limit=max(1000, current_limit * 10),
                     max_input_chars=max_input_chars,
+                    target_year=target_year,
                 )
 
                 if not rows:
@@ -639,7 +674,13 @@ def main() -> int:
                 del rows
                 del inputs
 
-            done_row = conn.execute("SELECT COUNT(*) FROM embeddings WHERE model = ?", (model,)).fetchone()
+            if target_year > 0:
+                done_row = conn.execute(
+                    "SELECT COUNT(*) FROM embeddings WHERE model = ? AND year = ?",
+                    (model, target_year),
+                ).fetchone()
+            else:
+                done_row = conn.execute("SELECT COUNT(*) FROM embeddings WHERE model = ?", (model,)).fetchone()
             total_for_model = int(done_row[0]) if done_row else 0
             print(
                 "[EMBED][DONE] "

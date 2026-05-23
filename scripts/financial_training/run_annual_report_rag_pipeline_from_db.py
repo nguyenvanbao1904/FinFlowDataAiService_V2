@@ -354,6 +354,24 @@ def _get_report_source(
     return dict(zip(keys, row))
 
 
+def _count_report_chunks(
+    db_path: Path,
+    *,
+    stock_code: str,
+    year: int,
+) -> int:
+    if not db_path.exists():
+        return 0
+    _ensure_chunks_db_schema(db_path)
+    stock = str(stock_code).strip().upper()
+    with _open_chunks_db(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE stock_code = ? AND year = ?",
+            (stock, int(year)),
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 def _should_skip_report(
     existing: dict[str, Any] | None,
     *,
@@ -361,8 +379,13 @@ def _should_skip_report(
     parser_backend: str,
     chunker_signature: str,
     force_refresh_existing: bool,
+    existing_chunks_count: int = 0,
 ) -> bool:
-    if force_refresh_existing or not existing:
+    if force_refresh_existing:
+        return False
+    if int(existing_chunks_count or 0) > 0:
+        return True
+    if not existing:
         return False
     return (
         str(existing.get("status") or "") == "chunked"
@@ -631,6 +654,8 @@ def _build_worker_command(
         str(args.report_target_year),
         "--exchange-filter",
         exchange_filter_value,
+        "--symbol-filter",
+        str(args.symbol_filter),
         "--shard-count",
         str(shard_count),
         "--shard-index",
@@ -861,8 +886,9 @@ def _run_symbol_shard_partition(args: argparse.Namespace) -> int:
             checkpoint_backend=str(args.checkpoint_backend),
         )
 
-    processes: dict[int, tuple[subprocess.Popen[bytes], Any]] = {}
     worker_db_paths: dict[int, Path] = {}
+
+    worker_commands: dict[int, tuple[list[str], Path | None]] = {}
     for shard_idx in range(shard_count):
         worker_name = f"shard_{shard_idx:02d}_of_{shard_count:02d}"
         worker_dir = args.workers_dir / worker_name
@@ -913,6 +939,22 @@ def _run_symbol_shard_partition(args: argparse.Namespace) -> int:
             shard_count=shard_count,
             shard_index=shard_idx,
         )
+        worker_commands[shard_idx] = (cmd, None)
+
+    failures: dict[int, int] = {}
+    running: dict[int, tuple[subprocess.Popen[bytes], Path | None]] = {}
+    pending = list(range(shard_count))
+    max_concurrent_workers = int(args.max_concurrent_workers or 0)
+    if max_concurrent_workers <= 0:
+        max_concurrent_workers = shard_count
+    max_concurrent_workers = max(1, min(shard_count, max_concurrent_workers))
+
+    def start_next_worker() -> None:
+        if not pending:
+            return
+        shard_idx = pending.pop(0)
+        worker_name = f"shard_{shard_idx:02d}_of_{shard_count:02d}"
+        cmd, _ = worker_commands[shard_idx]
         proc, log_path = _start_worker_process(
             args=args,
             cmd=cmd,
@@ -922,23 +964,40 @@ def _run_symbol_shard_partition(args: argparse.Namespace) -> int:
             print(f"[WORKER][START] shard={shard_idx}/{shard_count} log_mode=inherit cmd={' '.join(cmd)}")
         else:
             print(f"[WORKER][START] shard={shard_idx}/{shard_count} log={log_path} cmd={' '.join(cmd)}")
-        processes[shard_idx] = (proc, log_path)
+        running[shard_idx] = (proc, log_path)
 
-    failures: dict[int, int] = {}
-    for shard_idx, (proc, log_path) in processes.items():
-        code = proc.wait()
-        if code != 0:
-            failures[shard_idx] = int(code)
-            print(
-                f"[WORKER][FAIL] shard={shard_idx} exit_code={code}"
-                + (f" log={log_path}" if log_path is not None else "")
-            )
-        else:
-            db_count = _count_chunks_in_db(worker_db_paths[shard_idx])
-            print(
-                f"[WORKER][DONE] shard={shard_idx} chunks={db_count} db={worker_db_paths[shard_idx]}"
-                + (f" log={log_path}" if log_path is not None else "")
-            )
+    print(
+        "[WORKER][CONCURRENCY] "
+        f"shard_count={shard_count} max_concurrent_workers={max_concurrent_workers}"
+    )
+    while pending and len(running) < max_concurrent_workers:
+        start_next_worker()
+
+    while running:
+        finished: list[int] = []
+        for shard_idx, (proc, log_path) in list(running.items()):
+            code = proc.poll()
+            if code is None:
+                continue
+            finished.append(shard_idx)
+            if code != 0:
+                failures[shard_idx] = int(code)
+                print(
+                    f"[WORKER][FAIL] shard={shard_idx} exit_code={code}"
+                    + (f" log={log_path}" if log_path is not None else "")
+                )
+            else:
+                db_count = _count_chunks_in_db(worker_db_paths[shard_idx])
+                print(
+                    f"[WORKER][DONE] shard={shard_idx} chunks={db_count} db={worker_db_paths[shard_idx]}"
+                    + (f" log={log_path}" if log_path is not None else "")
+                )
+        for shard_idx in finished:
+            running.pop(shard_idx, None)
+        while pending and len(running) < max_concurrent_workers:
+            start_next_worker()
+        if running:
+            time.sleep(2.0)
 
     if failures:
         print(f"[WORKER][SUMMARY] failures={failures}")
@@ -1029,7 +1088,7 @@ def _merge_worker_chunk_dbs(
 
                 conn.execute(
                     f"""
-                    INSERT INTO chunks (
+                    INSERT OR REPLACE INTO chunks (
                         chunk_id,
                         stock_code,
                         year,
@@ -1051,21 +1110,59 @@ def _merge_worker_chunk_dbs(
                         worker_id,
                         chunk_json
                     FROM {alias}.chunks
-                    WHERE 1=1
-                    ON CONFLICT(chunk_id) DO UPDATE SET
-                        stock_code = excluded.stock_code,
-                        year = excluded.year,
-                        category = excluded.category,
-                        source_file = excluded.source_file,
-                        page_start = excluded.page_start,
-                        page_end = excluded.page_end,
-                        worker_id = excluded.worker_id,
-                        chunk_json = excluded.chunk_json
                     """
                 )
                 total_merged += worker_rows
+                try:
+                    source_row = conn.execute(
+                        f"SELECT COUNT(*) FROM {alias}.sqlite_master WHERE type = 'table' AND name = 'report_sources'"
+                    ).fetchone()
+                    has_report_sources = bool(source_row and int(source_row[0] or 0) > 0)
+                except sqlite3.OperationalError:
+                    has_report_sources = False
+                if has_report_sources:
+                    conn.execute(
+                        f"""
+                        INSERT OR REPLACE INTO report_sources (
+                            report_id,
+                            stock_code,
+                            year,
+                            source_url,
+                            source_name,
+                            file_name,
+                            file_sha256,
+                            status,
+                            parser_backend,
+                            chunker_signature,
+                            chunks_count,
+                            error_message,
+                            processed_at,
+                            updated_at
+                        )
+                        SELECT
+                            report_id,
+                            stock_code,
+                            year,
+                            source_url,
+                            source_name,
+                            file_name,
+                            file_sha256,
+                            status,
+                            parser_backend,
+                            chunker_signature,
+                            chunks_count,
+                            error_message,
+                            processed_at,
+                            updated_at
+                        FROM {alias}.report_sources
+                        """
+                    )
                 conn.commit()
             finally:
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
                 conn.execute(f"DETACH DATABASE {alias}")
     return total_merged
 
@@ -1073,6 +1170,7 @@ def _merge_worker_chunk_dbs(
 def _fetch_symbols_from_companies(
     *,
     exchange_filter: set[str],
+    symbol_filter: set[str],
     limit_symbols: int,
 ) -> list[tuple[str, str]]:
     host = settings.MYSQL_HOST
@@ -1115,6 +1213,8 @@ def _fetch_symbols_from_companies(
         exchange = str(row.get("exchange") or "").strip().upper()
         if not symbol:
             continue
+        if symbol_filter and symbol not in symbol_filter:
+            continue
         if exchange_filter and exchange not in exchange_filter:
             continue
         if symbol in seen:
@@ -1142,6 +1242,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--report-target-year",
+        "--target-year",
         dest="report_target_year",
         type=int,
         default=0,
@@ -1157,6 +1258,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Optional CSV exchanges filter (e.g. HOSE,HNX,UPCOM). Empty = all exchanges in companies table",
+    )
+    parser.add_argument(
+        "--symbol-filter",
+        type=str,
+        default="",
+        help="Optional CSV symbols filter (e.g. ACB,FPT). Empty = all symbols in companies table",
     )
     parser.add_argument(
         "--limit-symbols",
@@ -1188,6 +1295,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--rebuild-fts-only",
         action="store_true",
         help="Rebuild SQLite FTS5/BM25 index from --output-chunks-db and exit",
+    )
+    parser.add_argument(
+        "--merge-workers-only",
+        action="store_true",
+        help="Merge existing worker shard SQLite DBs into --output-chunks-db, rebuild FTS, finalize, and exit without crawling.",
     )
     parser.add_argument(
         "--fts-rebuild-batch-size",
@@ -1257,6 +1369,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Shard index used in single mode with --shard-count > 1.",
+    )
+    parser.add_argument(
+        "--max-concurrent-workers",
+        type=int,
+        default=0,
+        help=(
+            "Limit concurrently running workers in partition modes. "
+            "Use with --shard-count 12 to keep resume-compatible shard IDs while reducing OCR memory pressure. "
+            "Default 0 starts all workers."
+        ),
     )
 
     parser.add_argument("--min-chars", type=int, default=300)
@@ -1362,6 +1484,29 @@ def main() -> int:
             fast_pragmas=True,
         ) >= 0 else 2
 
+    if bool(args.merge_workers_only):
+        shard_count = max(1, int(args.shard_count))
+        worker_db_paths = [
+            args.workers_dir / f"shard_{idx:02d}_of_{shard_count:02d}" / "chunks.sqlite"
+            for idx in range(shard_count)
+        ]
+        merged_rows = _merge_worker_chunk_dbs(
+            worker_db_paths=worker_db_paths,
+            output_db_path=args.output_chunks_db,
+        )
+        final_count = _count_chunks_in_db(args.output_chunks_db)
+        print(
+            "[WORKER][MERGE] "
+            f"workers={shard_count} merged_rows={merged_rows} final_unique_chunks={final_count} "
+            f"output_db={args.output_chunks_db}"
+        )
+        _rebuild_chunks_fts(
+            args.output_chunks_db,
+            batch_size=max(1, int(args.fts_rebuild_batch_size)),
+            fast_pragmas=True,
+        )
+        return _finalize_from_storage(args)
+
     if str(args.worker_mode) == "exchange-partition":
         return _run_exchange_partition(args)
     if str(args.worker_mode) == "symbol-shard-partition":
@@ -1438,8 +1583,10 @@ def main() -> int:
 
     if not args.skip_crawl:
         exchange_filter = _parse_exchange_filter(str(args.exchange_filter))
+        symbol_filter = {item.strip().upper() for item in str(args.symbol_filter or "").split(",") if item.strip()}
         symbol_exchange_pairs = _fetch_symbols_from_companies(
             exchange_filter=exchange_filter,
+            symbol_filter=symbol_filter,
             limit_symbols=max(0, int(args.limit_symbols)),
         )
         shard_count = max(1, int(args.shard_count))
@@ -1460,6 +1607,7 @@ def main() -> int:
             "[DB][SYMBOLS] "
             f"loaded={len(symbol_exchange_pairs)} "
             f"exchange_filter={sorted(exchange_filter) if exchange_filter else 'ALL'} "
+            f"symbol_filter={sorted(symbol_filter) if symbol_filter else 'ALL'} "
             f"shard={shard_index}/{shard_count}"
         )
 
@@ -1537,17 +1685,38 @@ def main() -> int:
                         stock_code=symbol,
                         year=report_year,
                     )
+                    existing_chunks_count = _count_report_chunks(
+                        args.output_chunks_db,
+                        stock_code=symbol,
+                        year=report_year,
+                    )
                     if _should_skip_report(
                         existing_report,
                         source_url=source_url,
                         parser_backend=str(args.parser_backend),
                         chunker_signature=active_chunker_signature,
                         force_refresh_existing=bool(args.force_refresh_existing),
+                        existing_chunks_count=existing_chunks_count,
                     ):
                         crawl_summary["deduplicated"] += 1
+                        if existing_report is None and existing_chunks_count > 0:
+                            _mark_report_source(
+                                args.output_chunks_db,
+                                stock_code=symbol,
+                                year=report_year,
+                                source_url=source_url,
+                                source_name=report_name,
+                                file_name=None,
+                                file_sha256=None,
+                                status="chunked",
+                                parser_backend=str(args.parser_backend),
+                                chunker_signature=active_chunker_signature,
+                                chunks_count=existing_chunks_count,
+                                error_message="backfilled_from_existing_chunks",
+                            )
                         print(
                             f"[RAG][SKIP] already_chunked symbol={symbol} "
-                            f"year={report_year} parts={len(report_urls)}"
+                            f"year={report_year} parts={len(report_urls)} chunks={existing_chunks_count}"
                         )
                         continue
 
@@ -1654,10 +1823,11 @@ def main() -> int:
                                 file_name="|".join(path.name for path in saved_paths),
                                 file_sha256=hashlib.sha256("|".join(part_hashes).encode()).hexdigest()
                                 if part_hashes else None,
-                                status="chunked",
                                 parser_backend=str(args.parser_backend),
                                 chunker_signature=active_chunker_signature,
+                                status="chunked" if saved > 0 else "chunk_failed",
                                 chunks_count=saved,
+                                error_message=None if saved > 0 else "chunking_produced_zero_chunks",
                             )
                             print(
                                 "[STREAM][CHECKPOINT] "
