@@ -218,7 +218,7 @@ def _register_market_tools(agent: Agent[AppDeps, str]) -> None:
         ctx: RunContext[AppDeps], symbol: str, annualLimit: int | None = None,
     ) -> dict:
         """Lịch sử cổ tức của công ty theo năm.
-        Dùng khi user hỏi về cổ tức, dividend yield, chính sách trả cổ tức."""
+        Dùng khi user hỏi về cổ tức, tỷ suất cổ tức, chính sách trả cổ tức."""
         return await _call_market(ctx, "get_company_dividends", symbol=symbol, annualLimit=annualLimit)
 
     @agent.tool
@@ -579,7 +579,7 @@ def _register_compute_tool(agent: Agent[AppDeps, str]) -> None:
         symbol: str,
         target_year: int | None = None,
     ) -> dict:
-        """Tính giá trị hợp lý cổ phiếu bằng phương pháp PE/PB target (forward-looking, dùng forecast).
+        """Tính giá trị hợp lý cổ phiếu bằng phương pháp định giá phù hợp với đặc thù doanh nghiệp.
         Tool TỰ LẤY toàn bộ dữ liệu cần thiết và tính toán — KHÔNG cần gọi tool nào khác trước.
         Chỉ cần truyền mã cổ phiếu. Nếu user nói "tầm nhìn 2030" hoặc chỉ rõ năm → truyền target_year.
         So sánh 2 mã: gọi 2 lần ĐỒNG THỜI.
@@ -589,25 +589,32 @@ def _register_compute_tool(agent: Agent[AppDeps, str]) -> None:
         - "có tăng không", "mua ở giá này được không", "nên giữ hay bán"
         LUÔN gọi đồng thời get_company_live_valuation_snapshot để bổ sung so sánh lịch sử.
 
-        Kết quả gồm: fair_value_pe, fair_value_pb, summary, verdict, growth_source,
-        forecast_series (lộ trình LNST/DT tới năm mục tiêu), forecast_top_factors.
+        Kết quả gồm: valuation_model, valuation_formula, model_reason, model_confidence, key_assumptions,
+        summary, verdict, growth_source, forecast_series (lộ trình LNST/DT tới năm mục tiêu),
+        forecast_top_factors.
 
-        Trình bày kết quả theo cấu trúc:
-        1. Giới thiệu ngắn (1 câu) về công ty.
-        2. Dự phóng tăng trưởng:
-           - Nếu growth_source="forecast": đưa TẤT CẢ năm trong forecast_series vào bảng
-             (kể cả năm trùng năm hiện tại — đây là năm dự phóng, không phải quá khứ).
-             LUÔN làm tròn: 17,252 tỷ → "khoảng 17,300 tỷ" hoặc "~17.3 nghìn tỷ".
-             LUÔN dùng "ước tính / khoảng / dự kiến / xấp xỉ" — không trình bày như số chắc chắn.
-           - Nêu CAGR dự phóng vs CAGR lịch sử.
-           - Nếu có forecast_top_factors: nêu 2-3 yếu tố chính, chỉ hướng tác động (tích cực/tiêu cực),
-             KHÔNG trích dẫn con số feature_value (thang đo nội bộ).
-             VD đúng: "Biên lãi thuần thu hẹp là yếu tố kìm hãm"
-             VD sai: "NIM đi ngang ở mức 2.62%"
-             Diễn giải tên biến tự nhiên: "biên lãi thuần" thay vì "nim_pct".
-        3. Kết quả định giá: trích dẫn nguyên văn trường "summary".
-        4. Nhận xét: so sánh upside vs rủi ro. Lồng ghép thông tin từ search_annual_reports nếu đã gọi.
-        SAU KHI có kết quả, gọi search_annual_reports để bổ sung góc nhìn chiến lược/rủi ro nếu cần."""
+        Khi trả lời, hãy linh hoạt như CFO, không cần ép đúng một template. Nên có các ý chính:
+        - Giá hiện tại, giá hợp lý, upside/downside và kết luận.
+        - Tên công ty và ngành phải lấy từ company_name/industry_label/industry_key trong kết quả tool.
+          Không tự suy diễn ngành. Nếu ngành không rõ, nói "ngành chưa rõ trong dữ liệu".
+        - Phương pháp định giá bằng tiếng Việt tự nhiên và công thức valuation_formula nếu hữu ích.
+        - Vì sao phương pháp đó phù hợp với doanh nghiệp.
+        - Một vài giả định chính: tăng trưởng dự phóng, tỷ lệ cổ tức tiền mặt/lợi nhuận sau thuế,
+          tỷ suất cổ tức tiền mặt trên giá cổ phiếu, ROE chuẩn hóa, hoặc P/E/P/B lịch sử nếu liên quan.
+        - Rủi ro lớn nhất làm định giá sai.
+
+        Không lộ tên model nội bộ tiếng Anh như normalized_earnings, bank_pe_pb_blend,
+        earnings_exit, ddm_dividend_discount. Không dùng từ "payout" hoặc "dividend yield"
+        nếu có thể nói tiếng Việt.
+        Nếu có forecast_top_factors: chỉ nêu 2-3 yếu tố chính và hướng tác động, không trích feature_value.
+        Khi user hỏi định giá/phân tích/so sánh cổ phiếu cụ thể, NÊN gọi search_annual_reports sau định giá
+        để bổ sung chất lượng mô hình kinh doanh, nguồn lợi nhuận chính, công ty liên doanh/liên kết,
+        cổ tức, chiến lược và rủi ro. Query nên nêu thẳng các ý này, ví dụ:
+        "nguồn lợi nhuận chính, lợi nhuận từ công ty liên doanh liên kết, cổ tức, mô hình kinh doanh,
+        chiến lược và rủi ro"; với doanh nghiệp có liên doanh lớn có thể thêm tên đối tác nếu biết.
+        Nếu so sánh 2-3 mã, gọi RAG cho từng mã được so sánh. Nếu nhiều hơn 3 mã,
+        chỉ gọi RAG cho tối đa 3 mã trọng yếu hoặc mã user nhấn mạnh để tránh quá chậm.
+        Không dùng kết quả RAG để tạo mục "Nguồn"; chỉ dùng để làm nhận xét kinh doanh thông minh hơn."""
         inputs = await fetch_valuation_inputs(ctx.deps.market_client, symbol, target_year)
         if "error" in inputs and len(inputs) == 1:
             raise ModelRetry(
@@ -636,7 +643,10 @@ def _register_rag_tool(agent: Agent[AppDeps, str]) -> None:
         """Tìm kiếm thông tin định tính từ báo cáo thường niên (~700 công ty, 5 năm 2019-2024).
         Dùng khi cần: chiến lược kinh doanh, rủi ro, quản trị, kế hoạch mở rộng, triển vọng ngành,
         giải thích nguyên nhân biến động tài chính.
-        NÊN gọi SAU compute_fair_value để bổ sung góc nhìn chiến lược cho định giá.
+        Gọi khi user hỏi định giá/phân tích/so sánh cổ phiếu cụ thể để bổ sung mô hình kinh doanh,
+        nguồn lợi nhuận chính, liên doanh/liên kết, chiến lược và rủi ro định tính.
+        Không dùng tool này chỉ để gắn "nguồn" cho một câu trả lời định giá định lượng.
+        Hiện chưa hỗ trợ mở PDF đúng trang từ citation, nên không quảng cáo khả năng bấm nguồn như NotebookLM.
         Kết quả: tối đa 6 đoạn văn bản từ báo cáo, mỗi đoạn tối đa 1200 ký tự."""
         ticker_clean = (ticker or "").strip().upper()
         query_clean = (query or "").strip()
