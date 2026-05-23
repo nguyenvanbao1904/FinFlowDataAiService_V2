@@ -53,6 +53,11 @@ def _result_to_response(result: dict, fallback_symbol: str, fallback_year: int) 
         peTarget=result.get("pe_target", 0),
         pbTarget=result.get("pb_target", 0),
         cagr=result.get("cagr_pct", 0),
+        valuationModel=result.get("valuation_model"),
+        valuationFormula=result.get("valuation_formula"),
+        modelReason=result.get("model_reason"),
+        modelConfidence=result.get("model_confidence"),
+        keyAssumptions=result.get("key_assumptions"),
     )
 
 

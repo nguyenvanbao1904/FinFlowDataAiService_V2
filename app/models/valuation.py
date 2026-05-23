@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -25,4 +27,9 @@ class FairValueResponse(BaseModel):
     peTarget: float
     pbTarget: float
     cagr: float
+    valuationModel: str | None = None
+    valuationFormula: str | None = None
+    modelReason: str | None = None
+    modelConfidence: float | None = None
+    keyAssumptions: dict[str, Any] | None = None
     error: str | None = None

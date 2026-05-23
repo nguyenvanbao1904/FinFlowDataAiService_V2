@@ -75,7 +75,19 @@ async def fetch_valuation_inputs(
     fin_data = financial_r.get("data") or {}
     raw_entries = fin_data.get("nonBank") or fin_data.get("bank") or []
     profit_history = [
-        {"year": item["year"], "profit_after_tax": item.get("profitAfterTax", 0)}
+        {
+            "year": item["year"],
+            "profit_after_tax": item.get("profitAfterTax", 0),
+            "eps": item.get("eps"),
+            "bvps": item.get("bvps"),
+            "roe": item.get("roe"),
+            "pe": item.get("pe"),
+            "pb": item.get("pb"),
+            "payout_ratio": item.get("payoutRatio"),
+            "cash_dividend": item.get("cashDividend"),
+            "profit_growth": item.get("profitGrowth"),
+            "shares_outstanding": item.get("shareAtPeriodEnd"),
+        }
         for item in raw_entries
         if isinstance(item, dict) and "year" in item
         and (item.get("quarter") is None or item.get("quarter") == 0)
