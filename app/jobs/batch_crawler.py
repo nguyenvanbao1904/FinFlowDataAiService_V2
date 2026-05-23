@@ -3,11 +3,17 @@ import json
 import time
 import os
 import asyncio
+import argparse
 from pathlib import Path
 from datetime import datetime
+import sys
 
 from dotenv import load_dotenv
 import pymysql
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 load_dotenv()
 
@@ -36,6 +42,9 @@ MAX_WORKERS = 8
 RETRY_MAX = 3
 SAFE_DELAY = 0.5
 REFRESH_RECENT_YEARS = int(os.getenv("CRAWLER_REFRESH_RECENT_YEARS", "1"))
+TARGET_YEAR = int(os.getenv("CRAWLER_TARGET_YEAR", "0") or "0")
+TARGET_QUARTER = int(os.getenv("CRAWLER_TARGET_QUARTER", "0") or "0")
+SKIP_EXISTING_TARGET = os.getenv("CRAWLER_SKIP_EXISTING_TARGET", "true").strip().lower() not in {"0", "false", "no"}
 
 
 def load_state():
@@ -89,7 +98,15 @@ def _load_existing_periods(symbol: str) -> dict[str, set[tuple[int, int]]]:
     return out
 
 
-def _filter_incremental_periods(rows, existing_periods: set[tuple[int, int]], *, refresh_recent_years: int):
+def _filter_incremental_periods(
+    rows,
+    existing_periods: set[tuple[int, int]],
+    *,
+    refresh_recent_years: int,
+    target_year: int = 0,
+    target_quarter: int = 0,
+    skip_existing_target: bool = True,
+):
     if not rows:
         return []
     current_year = datetime.now().year
@@ -101,6 +118,15 @@ def _filter_incremental_periods(rows, existing_periods: set[tuple[int, int]], *,
         try:
             key = (int(year), int(quarter))
         except Exception:
+            filtered.append(row)
+            continue
+        if target_year > 0:
+            if key[0] != target_year:
+                continue
+            if target_quarter > 0 and key[1] != target_quarter:
+                continue
+            if skip_existing_target and key in existing_periods:
+                continue
             filtered.append(row)
             continue
         if key not in existing_periods or key[0] >= refresh_from_year:
@@ -142,6 +168,9 @@ def run_crawler_for_symbol(sym_data: tuple):
         inds,
         existing_periods["indicators"],
         refresh_recent_years=REFRESH_RECENT_YEARS,
+        target_year=TARGET_YEAR,
+        target_quarter=TARGET_QUARTER,
+        skip_existing_target=SKIP_EXISTING_TARGET,
     )
     if raw_inds_count == 0:
         errors.append(f"Indicators failed: {w_inds}")
@@ -153,6 +182,9 @@ def run_crawler_for_symbol(sym_data: tuple):
         incomes,
         existing_periods["income"],
         refresh_recent_years=REFRESH_RECENT_YEARS,
+        target_year=TARGET_YEAR,
+        target_quarter=TARGET_QUARTER,
+        skip_existing_target=SKIP_EXISTING_TARGET,
     )
     if raw_incomes_count == 0:
         errors.append(f"Income failed: {w_inc}")
@@ -164,6 +196,9 @@ def run_crawler_for_symbol(sym_data: tuple):
         balances,
         existing_periods["balance"],
         refresh_recent_years=REFRESH_RECENT_YEARS,
+        target_year=TARGET_YEAR,
+        target_quarter=TARGET_QUARTER,
+        skip_existing_target=SKIP_EXISTING_TARGET,
     )
     if raw_balances_count == 0:
         errors.append(f"Balance failed: {w_bal}")
@@ -174,10 +209,13 @@ def run_crawler_for_symbol(sym_data: tuple):
         cashflows,
         existing_periods["cashflow"],
         refresh_recent_years=REFRESH_RECENT_YEARS,
+        target_year=TARGET_YEAR,
+        target_quarter=TARGET_QUARTER,
+        skip_existing_target=SKIP_EXISTING_TARGET,
     )
 
     logger.info(
-        "[%s] incremental payload sizes: indicators=%d/%d income=%d/%d balance=%d/%d cashflow=%d",
+        "[%s] incremental payload sizes: indicators=%d/%d income=%d/%d balance=%d/%d cashflow=%d target_year=%s target_quarter=%s skip_existing_target=%s",
         symbol,
         len(inds),
         raw_inds_count,
@@ -186,6 +224,9 @@ def run_crawler_for_symbol(sym_data: tuple):
         len(balances),
         raw_balances_count,
         len(cashflows),
+        TARGET_YEAR or "latest-refresh",
+        TARGET_QUARTER or "all",
+        SKIP_EXISTING_TARGET,
     )
 
     # 5. Shareholders
@@ -304,10 +345,10 @@ def get_market_symbols() -> list[tuple[str, bool, str]]:
     """Fetch ALL symbols from FireAnt, auto-detect bank vs non-bank."""
     logger.info("Fetching symbol list from FireAnt...")
 
-    debug_env = os.getenv("DEBUG_SYMBOLS", "")
-    if debug_env:
-        forced = [s.strip().upper() for s in debug_env.split(",") if s.strip()]
-        logger.info("DEBUG_SYMBOLS override: %s", forced)
+    symbol_filter_env = os.getenv("CRAWLER_SYMBOL_FILTER", "") or os.getenv("DEBUG_SYMBOLS", "")
+    if symbol_filter_env:
+        forced = [s.strip().upper() for s in symbol_filter_env.split(",") if s.strip()]
+        logger.info("Symbol filter override: %s", forced)
         crawler = FireAntCrawlerService()
         result = []
         for sym in forced:
@@ -380,8 +421,15 @@ def run_batch_crawl():
     skip_successful = os.getenv("CRAWLER_SKIP_SUCCESSFUL", "false").strip().lower() in {"1", "true", "yes"}
     pending_symbols = [s for s in symbols_to_crawl if (not skip_successful or s[0] not in successful_list)]
     logger.info(
-        "Total: %d. Previously successful: %d. Pending this run: %d. skip_successful=%s refresh_recent_years=%d",
-        len(symbols_to_crawl), len(successful_list), len(pending_symbols), skip_successful, REFRESH_RECENT_YEARS,
+        "Total: %d. Previously successful: %d. Pending this run: %d. skip_successful=%s refresh_recent_years=%d target_year=%s target_quarter=%s skip_existing_target=%s",
+        len(symbols_to_crawl),
+        len(successful_list),
+        len(pending_symbols),
+        skip_successful,
+        REFRESH_RECENT_YEARS,
+        TARGET_YEAR or "latest-refresh",
+        TARGET_QUARTER or "all",
+        SKIP_EXISTING_TARGET,
     )
 
     if not pending_symbols:
@@ -415,5 +463,66 @@ def run_batch_crawl():
             json.dump(failed_report, f, ensure_ascii=False, indent=4)
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Crawl FireAnt financial data and sync it into FinFlow MySQL via backend")
+    parser.add_argument(
+        "--target-year",
+        type=int,
+        default=TARGET_YEAR,
+        help="Only push financial rows for this exact year. Default 0 keeps the rolling incremental refresh behavior.",
+    )
+    parser.add_argument(
+        "--target-quarter",
+        type=int,
+        choices=[0, 1, 2, 3, 4],
+        default=TARGET_QUARTER,
+        help="Only push this exact quarter when --target-year is set. Use 0 for all quarters in the target year.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action=argparse.BooleanOptionalAction,
+        default=SKIP_EXISTING_TARGET,
+        help="When targeting a year/quarter, skip rows whose symbol/year/quarter already exists in MySQL.",
+    )
+    parser.add_argument(
+        "--refresh-recent-years",
+        type=int,
+        default=REFRESH_RECENT_YEARS,
+        help="Rolling refresh window used when no --target-year is supplied.",
+    )
+    parser.add_argument(
+        "--skip-successful",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("CRAWLER_SKIP_SUCCESSFUL", "false").strip().lower() in {"1", "true", "yes"},
+        help="Skip symbols listed as successful in crawler_state.json. Usually keep this false for periodic updates.",
+    )
+    parser.add_argument(
+        "--symbol-filter",
+        type=str,
+        default=os.getenv("CRAWLER_SYMBOL_FILTER", ""),
+        help="Optional CSV symbols to process, useful for smoke tests (e.g. ACB,FPT). Empty = all symbols.",
+    )
+    return parser
+
+
+def _apply_cli_settings(args: argparse.Namespace) -> None:
+    global TARGET_YEAR, TARGET_QUARTER, SKIP_EXISTING_TARGET, REFRESH_RECENT_YEARS
+
+    TARGET_YEAR = max(0, int(args.target_year or 0))
+    TARGET_QUARTER = max(0, int(args.target_quarter or 0))
+    if TARGET_QUARTER and TARGET_YEAR <= 0:
+        raise SystemExit("--target-quarter requires --target-year")
+    SKIP_EXISTING_TARGET = bool(args.skip_existing)
+    REFRESH_RECENT_YEARS = max(0, int(args.refresh_recent_years))
+
+    os.environ["CRAWLER_TARGET_YEAR"] = str(TARGET_YEAR)
+    os.environ["CRAWLER_TARGET_QUARTER"] = str(TARGET_QUARTER)
+    os.environ["CRAWLER_SKIP_EXISTING_TARGET"] = "true" if SKIP_EXISTING_TARGET else "false"
+    os.environ["CRAWLER_REFRESH_RECENT_YEARS"] = str(REFRESH_RECENT_YEARS)
+    os.environ["CRAWLER_SKIP_SUCCESSFUL"] = "true" if bool(args.skip_successful) else "false"
+    os.environ["CRAWLER_SYMBOL_FILTER"] = str(args.symbol_filter or "")
+
+
 if __name__ == "__main__":
+    _apply_cli_settings(_build_parser().parse_args())
     run_batch_crawl()
