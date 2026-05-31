@@ -65,8 +65,24 @@ class TransactionPrefillService:
                 "id": a.id,
                 "name": a.name,
                 "transactionEligible": a.transactionEligible,
+                "typeCode": a.typeCode,
+                "typeDisplayName": a.typeDisplayName,
+                "balance": a.balance,
+                "debt": a.debt,
             }
             for a in request.accounts
+        ]
+        recent_history = [
+            {
+                "amount": item.get("amount"),
+                "type": item.get("type"),
+                "categoryId": item.get("categoryId"),
+                "accountId": item.get("accountId"),
+                "note": self._sanitize_text(str(item.get("note") or ""))[:160],
+                "transactionDate": str(item.get("transactionDate") or ""),
+            }
+            for item in request.recentHistory[:20]
+            if isinstance(item, dict)
         ]
         tz = self._safe_zoneinfo(request.timezone)
         current_date_local = datetime.now(tz).isoformat(timespec="seconds")
@@ -80,6 +96,7 @@ class TransactionPrefillService:
             "- amount: MUST be the full integer value in VND. Apply multipliers: 'k', 'nghìn' = x 1,000; 'lít', 'xị' = x 100,000; 'củ', 'triệu' = x 1,000,000 (e.g., '30k' -> 30000, '2 xị' -> 200000).\n"
             "- transactionDate must be an ISO8601 string.\n"
             "- categoryId and accountId MUST exactly match the id from the provided lists below. Match by name or context.\n"
+            "- If RAW_TEXT does not explicitly mention an account, infer accountId from RECENT_HISTORY_JSON by preferring the most recent transaction with the same categoryId, then the same type. If there is still no match, choose the first transaction-eligible account.\n"
             "- If a required field cannot be reasonably deduced, leave it null and list the field name in missingFields.\n"
             "- **note**: Must be a concise, clean description of the transaction, extracted from RAW_TEXT BUT:\n"
             "    * Remove any amount, numeric value, currency unit (e.g., '2 xị', '200k', '30 nghìn', '10 triệu').\n"
@@ -92,6 +109,8 @@ class TransactionPrefillService:
             f"{json.dumps(categories, ensure_ascii=False, separators=(',', ':'))}\n\n"
             "ACCOUNTS_JSON=\n"
             f"{json.dumps(accounts, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            "RECENT_HISTORY_JSON=\n"
+            f"{json.dumps(recent_history, ensure_ascii=False, separators=(',', ':'))}\n\n"
             "RAW_TEXT=\n"
             f"{raw_text_block}\n"
         )
@@ -139,6 +158,11 @@ class TransactionPrefillService:
             warnings.append("Hệ thống: accountId không nằm trong danh sách cho phép")
             output.accountId = None
 
+        if output.accountId is None:
+            output.accountId = self._fallback_account_id(output, request)
+            if output.accountId is not None and "accountId" in missing:
+                missing.remove("accountId")
+
         if output.note:
             output.note = output.note[:500]
 
@@ -168,3 +192,33 @@ class TransactionPrefillService:
         output.warnings = warnings[:10]
 
         return output
+
+    @staticmethod
+    def _fallback_account_id(
+        output: TransactionPrefillResponse, request: TransactionPrefillRequest
+    ) -> str | None:
+        eligible_accounts = {
+            account.id
+            for account in request.accounts
+            if account.transactionEligible is not False
+        }
+        if not eligible_accounts:
+            return None
+
+        if output.categoryId:
+            for item in request.recentHistory:
+                if not isinstance(item, dict):
+                    continue
+                account_id = str(item.get("accountId") or "")
+                if item.get("categoryId") == output.categoryId and account_id in eligible_accounts:
+                    return account_id
+
+        if output.type:
+            for item in request.recentHistory:
+                if not isinstance(item, dict):
+                    continue
+                account_id = str(item.get("accountId") or "")
+                if item.get("type") == output.type and account_id in eligible_accounts:
+                    return account_id
+
+        return next((account.id for account in request.accounts if account.id in eligible_accounts), None)

@@ -150,3 +150,67 @@ async def test_prefill_baseline(case, deepseek_mock, captured_requests):
         assert existing["service_response"] == snapshot["service_response"], (
             "Service response drift detected"
         )
+
+
+async def test_prefill_falls_back_to_recent_account_for_category(deepseek_mock):
+    from app.services.prefill_service import TransactionPrefillService
+
+    service = TransactionPrefillService()
+    response_payload = make_json_response({
+        "amount": 30000,
+        "type": "EXPENSE",
+        "categoryId": "cat-food",
+        "accountId": None,
+        "note": "ăn trưa",
+        "transactionDate": "2026-05-01T12:00:00+07:00",
+        "confidence": 0.8,
+        "missingFields": ["accountId"],
+        "warnings": [],
+    })
+    request = TransactionPrefillRequest(
+        rawText="ăn trưa 30k",
+        categories=CATEGORIES,
+        accounts=ACCOUNTS,
+        recentHistory=[
+            {
+                "amount": 45000,
+                "type": "EXPENSE",
+                "categoryId": "cat-food",
+                "accountId": "acc-bank",
+                "note": "ăn tối",
+                "transactionDate": "2026-04-30T19:00:00",
+            }
+        ],
+        locale="vi-VN",
+        timezone="Asia/Ho_Chi_Minh",
+        source="text",
+    )
+
+    with deepseek_mock(responses=[response_payload]):
+        result = await service.prefill(request)
+
+    assert result.accountId == "acc-bank"
+    assert "accountId" not in result.missingFields
+
+
+async def test_prefill_falls_back_to_first_eligible_account_without_history(deepseek_mock):
+    from app.services.prefill_service import TransactionPrefillService
+
+    service = TransactionPrefillService()
+    response_payload = make_json_response({
+        "amount": 30000,
+        "type": "EXPENSE",
+        "categoryId": "cat-food",
+        "accountId": None,
+        "note": "ăn trưa",
+        "transactionDate": "2026-05-01T12:00:00+07:00",
+        "confidence": 0.8,
+        "missingFields": ["accountId"],
+        "warnings": [],
+    })
+
+    with deepseek_mock(responses=[response_payload]):
+        result = await service.prefill(_build_request("ăn trưa 30k"))
+
+    assert result.accountId == "acc-cash"
+    assert "accountId" not in result.missingFields

@@ -15,6 +15,10 @@ class AccountCandidate(BaseModel):
     id: str
     name: str
     transactionEligible: Optional[bool] = None
+    typeCode: Optional[str] = None
+    typeDisplayName: Optional[str] = None
+    balance: Optional[float] = None
+    debt: Optional[bool] = None
 
 
 class TransactionPrefillRequest(BaseModel):
